@@ -53,20 +53,25 @@ impl T5ModelBuilder {
 
 fn main() -> Result<()> {
 
-    let (builder, mut tokenizer) = T5ModelBuilder::load()?;
-    let _tokenizer = tokenizer
-        .with_padding(None)
-        .with_truncation(None)
-        .map_err(E::msg)?;
-    let mut model = builder.build_encoder()?;
-    let tokens = tokenizer
-        .encode("FOo bar baz", true)
-        .map_err(E::msg)?
-        .get_ids()
-        .to_vec();
-    let token_ids = Tensor::new(&tokens[..], model.device())?.unsqueeze(0)?;
-    let embeddings = model.forward(&token_ids)?;
-    println!("embeddings {}", normalize_l2(&embeddings).unwrap());
+    let (builder, tokenizer) = T5ModelBuilder::load()?;
+    let model = builder.build_encoder()?;
+
+    loop {
+        let now = std::time::Instant::now();
+        let tokens = tokenizer
+            .encode("do buildings change size due to weather?", true)
+            .map_err(E::msg)?
+            .get_ids()
+            .to_vec();
+        let token_ids = Tensor::new(&tokens[..], model.device())?.unsqueeze(0)?;
+        println!("ids {}", token_ids);
+        let embeddings = model.forward(&token_ids)?;
+        let elapsed_time = now.elapsed();
+        println!("Running slow_function() took {} ms.", elapsed_time.as_millis());
+        println!("embeddings {}", embeddings);
+        //println!("embeddings {}", normalize_l2(&embeddings).unwrap());
+    }
+
 
     Ok(())
 }
