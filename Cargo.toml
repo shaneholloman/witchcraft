@@ -18,6 +18,8 @@ csv = "1.3.1"
 rand = "0.9.1"
 sqlite-vec = "0.1.6"
 rusqlite = "0.35.0"
+scan_dir = "0.3.3"
+sha2 = "0.10.9"
 
 #[dependencies.rusqlite]
 #version = "0.35.0"
