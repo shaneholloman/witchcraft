@@ -1,4 +1,3 @@
-//use csv::ReaderBuilder;
 use rand::prelude::*;
 use rusqlite::{Connection, Statement, Result as SQLResult};
 use scan_dir::ScanDir;
@@ -15,7 +14,6 @@ mod t5;
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor, D, IndexOp};
 use candle_nn::VarBuilder;
-//use hf_hub::{api::sync::Api, Repo, RepoType};
 use tokenizers::Tokenizer;
 
 const DTYPE: DType = DType::F32;
@@ -174,45 +172,68 @@ struct Document {
     hash: String,
 }
 
-fn gather_embeddings(query: &mut Query, model: t5::T5EncoderModel, tokenizer: Tokenizer) -> Result<Tensor> {
+pub struct Gatherer<'a> {
+    documents: Box<dyn Iterator<Item = Document> + 'a>,
+    tokenizer: Tokenizer,
+    model: t5::T5EncoderModel,
+}
 
-    let mut doc_embedding = vec![];
-    for document_iter in query.iter()? {
-
-        let document = document_iter?;
-        let filename = document.filename;
-        let _hash = document.hash;
-
-        let path = PathBuf::from(filename);
-        println!("read file {:?}", path);
-        let file = File::open(path)?;
-        let mut reader = BufReader::new(file);
-        let mut buffer = [0u8; 0x10000];
-
-        loop {
-            let bytes_read = reader.read(&mut buffer)?;
-            if bytes_read == 0 {
-                break;
-            }
-
-            let now = std::time::Instant::now();
-            let utf8 = std::str::from_utf8(&buffer[..bytes_read]).unwrap();
-            println!("utf8 {}", utf8);
-            let tokens = tokenizer
-                .encode(utf8, true)
-                .map_err(E::msg)?
-                .get_ids()
-                .to_vec();
-            let token_ids = Tensor::new(&tokens[..], model.device())?.unsqueeze(0)?;
-            let embeddings = model.forward(&token_ids)?;
-            let elapsed_time = now.elapsed();
-            println!("embedder took {} ms.", elapsed_time.as_millis());
-            let normalized = normalize_l2(&embeddings)?.get(0)?;
-            let split = split_tensor(&normalized);
-            doc_embedding.extend(split);
+impl<'a> Gatherer<'a> {
+    fn new(query: &'a mut Query, model: t5::T5EncoderModel, tokenizer: Tokenizer) -> Self {
+        let documents = Box::new(query.iter().unwrap().map(Result::unwrap));
+        Self {
+            documents,
+            tokenizer,
+            model,
         }
     }
-    Ok(stack_tensors(doc_embedding))
+}
+
+impl<'a> Iterator for Gatherer<'a> {
+    type Item = (String, Tensor);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let mut doc_embedding = vec![];
+        match self.documents.next() {
+            Some(document) => {
+                let filename = document.filename;
+                let hash = document.hash;
+
+                let path = PathBuf::from(filename);
+                println!("read file {:?}", path);
+                let file = File::open(path).unwrap();
+                let mut reader = BufReader::new(file);
+                let mut buffer = [0u8; 0x10000];
+
+                loop {
+                    let bytes_read = reader.read(&mut buffer).unwrap();
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    let now = std::time::Instant::now();
+                    let utf8 = std::str::from_utf8(&buffer[..bytes_read]).unwrap();
+                    let tokens = self.tokenizer
+                        .encode(utf8, true)
+                        .map_err(E::msg).unwrap()
+                        .get_ids()
+                        .to_vec();
+                    let token_ids = Tensor::new(&tokens[..], self.model.device()).unwrap().unsqueeze(0).unwrap();
+                    let embeddings = self.model.forward(&token_ids).unwrap();
+                    let elapsed_time = now.elapsed();
+                    println!("embedder took {} ms.", elapsed_time.as_millis());
+                    let normalized = normalize_l2(&embeddings).unwrap().get(0).unwrap();
+
+                    let split = split_tensor(&normalized);
+                    doc_embedding.extend(split);
+                }
+                Some((hash, stack_tensors(doc_embedding)))
+            }
+            None => {
+                None
+            }
+        }
+    }
 }
 
 struct DB {
@@ -225,32 +246,48 @@ struct Query<'connection> {
 
 impl DB {
     pub fn new() -> Self {
-        let connection = Connection::open_in_memory().unwrap();
-        Self { connection }
-    }
+        //let connection = Connection::open_in_memory().unwrap();
+        let connection = Connection::open("mydb.sqlite").unwrap();
 
-    pub fn init(self: &Self) -> Result<Query> {
         //unsafe {
             //let _guard = LoadExtensionGuard::new(&self.connection)?;
             //self.connection.load_extension("trusted/sqlite/extension", None)?
         //}
 
         println!("init");
-        let query = "CREATE TABLE document(filename TEXT, 
+        let query = "CREATE TABLE IF NOT EXISTS document(filename TEXT PRIMARY KEY,
             state TEXT CHECK(state IN ('new', 'indexed')),
             hash TEXT)";
-        self.connection.execute(query, ()).unwrap();
+        connection.execute(query, ()).unwrap();
 
-        let query = "CREATE TABLE chunk(hash TEXT, chunk INTEGER, embedding TEXT)";
-        self.connection.execute(query, ()).unwrap();
+        let query = "CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY, embedding TEXT)";
+        connection.execute(query, ()).unwrap();
+        Self { connection }
+    }
 
+    fn make_query(self: &Self) -> SQLResult<Query> {
         let stmt = self.connection.prepare("SELECT filename, state, hash FROM document WHERE state = 'new'")?;
         Ok(Query { stmt })
     }
 
-    fn add_doc(self: &Self, filename: &str, hash: &str) -> Result<()> {
-        self.connection.execute("INSERT INTO document VALUES(?1, 'new', ?2)", (&filename, &hash))?;
+    fn make_kmeans_query(self: &Self) -> SQLResult<Query> {
+        let stmt = self.connection.prepare("SELECT document.filename,document.state,document.hash FROM document,chunk
+            WHERE document.hash == chunk.hash AND
+            state = 'indexed'")?;
+        Ok(Query { stmt })
+    }
+
+    fn add_doc(self: &Self, filename: &str, hash: &str) -> SQLResult<()> {
+        self.connection.execute("INSERT OR IGNORE INTO document VALUES(?1, 'new', ?2)", (&filename, &hash))?;
         Ok(())
+    }
+
+    fn set_embeddings(self: &Self, hash: &str, embeddings: &Tensor) -> SQLResult<()> {
+        let es = format!("{}", embeddings);
+        let tx = self.connection.unchecked_transaction()?;
+        tx.execute("INSERT OR IGNORE INTO chunk VALUES(?1, ?2)", (&hash, &es)).unwrap();
+        tx.execute("UPDATE document set state = 'indexed' WHERE hash == ?1", (&hash, )).unwrap();
+        tx.commit()
     }
 }
 
@@ -271,13 +308,24 @@ fn main() -> Result<()> {
     let model = builder.build_encoder()?;
 
     let db = DB::new();
-    let mut query = db.init()?;
+    let mut query = db.make_query()?;
+    let mut kmeans_query = db.make_kmeans_query()?;
+
     register_documents(&db, "documents");
 
-    let matrix = gather_embeddings(&mut query, model, tokenizer)?;
-    let device = Device::Cpu;
-    let (_, idxs) = kmeans(&matrix, 16, 5, &device)?;
-    println!("idxs {}", idxs);
+    let embedding_iter = Gatherer::new(&mut query, model, tokenizer);
+    for (hash, embeddings) in embedding_iter {
+        db.set_embeddings(&hash, &embeddings);
+    }
+
+    for (document) in kmeans_query.iter()? {
+        println!("iter hash {}", document?.hash);
+    }
+
+    //let matrix = gather_embeddings(&mut query, model, tokenizer)?;
+    //let device = Device::Cpu;
+    //let (_, idxs) = kmeans(&matrix, 16, 5, &device)?;
+    //println!("idxs {}", idxs);
 
     Ok(())
 }
