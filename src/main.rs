@@ -90,7 +90,6 @@ fn kmeans(data: &Tensor, k: usize, max_iter: u32, device: &Device) -> Result<(Te
         println!("i {}", i);
         //let dist = cdist(data, &centers)?;
         let sim = data.matmul(&centers.transpose(D::Minus1, D::Minus2)?)?;
-        println!("got sim {}", sim);
         cluster_assignments = sim.argmax(D::Minus1)?;
         let mut centers_vec = vec![];
         for i in 0..k {
@@ -111,11 +110,18 @@ fn kmeans(data: &Tensor, k: usize, max_iter: u32, device: &Device) -> Result<(Te
             centers_vec.push(normalized?);
         }
         centers = Tensor::stack(centers_vec.as_slice(), 0)?;
-        println!("centers {}", centers);
     }
     Ok((centers, cluster_assignments))
 }
 
+fn match_centroids(embeddings: &Tensor, centers: &Tensor) -> Result<()> {
+    println!("match em");
+    let sim = embeddings.matmul(&centers.transpose(D::Minus1, D::Minus2)?).unwrap();
+    println!("sim {}", sim);
+    let cluster_assignments = sim.argmax(D::Minus1)?;
+    println!("got centroids {}", cluster_assignments);
+    Ok(())
+}
 
 fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
     let dims = tensor.dims();
@@ -183,19 +189,44 @@ struct Chunk {
     embedding: Vec<u8>,
 }
 
-pub struct Gatherer<'a> {
-    documents: Box<dyn Iterator<Item = Document> + 'a>,
+struct Embedder {
     tokenizer: Tokenizer,
     model: t5::T5EncoderModel,
 }
 
+impl Embedder {
+    fn new() -> Self {
+        let (builder, tokenizer) = T5ModelBuilder::load().unwrap();
+        let model = builder.build_encoder().unwrap();
+        Self {
+            tokenizer,
+            model
+        }
+    }
+    fn embed(self: &Self, text: &str) -> Result<Tensor> {
+        let tokens = self.tokenizer
+            .encode(text, true)
+            .map_err(E::msg).unwrap()
+            .get_ids()
+            .to_vec();
+        let token_ids = Tensor::new(&tokens[..], self.model.device()).unwrap().unsqueeze(0).unwrap();
+        let embeddings = self.model.forward(&token_ids).unwrap();
+        //println!("embedder took {} ms.", now.elapsed().as_millis());
+        normalize_l2(&embeddings)
+    }
+}
+
+pub struct Gatherer<'a> {
+    documents: Box<dyn Iterator<Item = Document> + 'a>,
+    embedder: &'a Embedder,
+}
+
 impl<'a> Gatherer<'a> {
-    fn new(query: &'a mut Query, model: t5::T5EncoderModel, tokenizer: Tokenizer) -> Self {
+    fn new(query: &'a mut Query, embedder: &'a Embedder) -> Self {
         let documents = Box::new(query.iter().unwrap().map(Result::unwrap));
         Self {
             documents,
-            tokenizer,
-            model,
+            embedder,
         }
     }
 }
@@ -224,15 +255,9 @@ impl<'a> Iterator for Gatherer<'a> {
 
                     let now = std::time::Instant::now();
                     let utf8 = std::str::from_utf8(&buffer[..bytes_read]).unwrap();
-                    let tokens = self.tokenizer
-                        .encode(utf8, true)
-                        .map_err(E::msg).unwrap()
-                        .get_ids()
-                        .to_vec();
-                    let token_ids = Tensor::new(&tokens[..], self.model.device()).unwrap().unsqueeze(0).unwrap();
-                    let embeddings = self.model.forward(&token_ids).unwrap();
+                    let embeddings = self.embedder.embed(utf8);
                     println!("embedder took {} ms.", now.elapsed().as_millis());
-                    let normalized = normalize_l2(&embeddings);
+                    let normalized = normalize_l2(&embeddings.unwrap());
 
                     let split = split_tensor(&normalized.ok()?.get(0).ok()?);
                     doc_embedding.extend(split);
@@ -347,18 +372,16 @@ pub fn u8_to_tensor2d_f32(bytes: &[u8], cols: usize) -> Tensor {
     Tensor::from_vec(f32s, (rows, cols), &Device::Cpu).unwrap()
 }
 
-
 fn main() -> Result<()> {
-    let (builder, tokenizer) = T5ModelBuilder::load()?;
-    let model = builder.build_encoder()?;
 
+    let embedder = Embedder::new();
     let db = DB::new();
     let mut query = db.make_query()?;
     let mut kmeans_query = db.make_kmeans_query()?;
 
     register_documents(&db, "documents").unwrap();
 
-    let embedding_iter = Gatherer::new(&mut query, model, tokenizer);
+    let embedding_iter = Gatherer::new(&mut query, &embedder);
     for (hash, embeddings) in embedding_iter {
         //println!("for hash {} {:?}", hash, embeddings.dims2().unwrap());
         //let (b, n) = embeddings.dims2().unwrap();
@@ -377,10 +400,16 @@ fn main() -> Result<()> {
     let device = Device::Cpu;
     let matrix = stack_tensors(all_embeddings);
     let now = std::time::Instant::now();
-    let (_, idxs) = kmeans(&matrix, 1024, 5, &device)?;
+    let (centers, idxs) = kmeans(&matrix, 1024, 5, &device)?;
     let elapsed_time = now.elapsed();
     println!("kmeans took {} ms.", elapsed_time.as_millis());
     println!("idxs {}", idxs);
+
+
+    let qe = embedder.embed("do children benefit from breast-feeding?")?.get(0)?;
+    let _ = match_centroids(&qe, &centers).unwrap();
+
+
     //println!("idxs {}", idxs);
     //println!("v {:?}", all_embeddings);
 
