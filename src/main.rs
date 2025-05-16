@@ -125,7 +125,6 @@ fn write_buckets(db: &DB,
         let vec = center.to_vec1::<f32>();
         let center_bytes = vec_f32_to_u8_vec(&vec?);
 
-        println!("indices vec {}", data_indices);
         let document_subset = document_indices.index_select(&data_indices, 0)?;
         let vec = document_subset.to_vec1::<u32>();
         let indices_bytes = vec_u32_to_u8_vec(&vec?);
@@ -180,7 +179,6 @@ fn match_centroids(bucket_query: &mut Query, query_embeddings: &Tensor, centers:
 
     let all_document_embeddings = Tensor::stack(all_document_embeddings.as_slice(), 1)?;
     let sim = query_embeddings.matmul(&all_document_embeddings)?.transpose(0, 1)?;
-    println!("all sim {}", sim);
 
     let mut last = std::u32::MAX;
     let mut current = Tensor::zeros((n,), DType::F32, &Device::Cpu)?;
@@ -618,13 +616,6 @@ fn main() -> Result<()> {
 
     let qe = embedder.embed("do buildings change size due to weather?")?.get(0)?;
     let _ = match_centroids(&mut bucket_query, &qe, &centers).unwrap();
-
-
-    //println!("idxs {}", idxs);
-    //println!("v {:?}", all_embeddings);
-
-    //let matrix = gather_embeddings(&mut query, model, tokenizer)?;
-    //let (_, idxs) = kmeans(&matrix, 16, 5, &device)?;
 
     Ok(())
 }
