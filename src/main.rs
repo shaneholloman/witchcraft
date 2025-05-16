@@ -2,7 +2,6 @@ use std::env;
 use rand::prelude::*;
 use rusqlite::{Connection, Statement, Result as SQLResult};
 use scan_dir::ScanDir;
-use serde::Deserialize;
 use sha2::{Sha256, Digest};
 use std::fs::File;
 use std::io::{BufReader, Read};
@@ -51,23 +50,6 @@ impl T5ModelBuilder {
         Ok(t5::T5EncoderModel::load(vb, &self.config)?)
     }
 
-}
-
-#[derive(Debug, Deserialize)]
-struct Record {
-    _line: u32,
-    text: String,
-}
-
-fn cdist(x1: &Tensor, x2: &Tensor) -> Result<Tensor> {
-    let x1 = x1.unsqueeze(0)?;
-    let x2 = x2.unsqueeze(1)?;
-    Ok(x1
-        .broadcast_sub(&x2)?
-        .sqr()?
-        .sum(D::Minus1)?
-        .sqrt()?
-        .transpose(D::Minus1, D::Minus2)?)
 }
 
 fn kmeans(data: &Tensor, k: usize, max_iter: u32, device: &Device) -> Result<(Tensor, Tensor)> {
@@ -245,7 +227,6 @@ fn register_documents(db: &DB, dirname: &str) -> Result<()> {
 
 struct Document {
     filename: String,
-    state: String,
     hash: String,
 }
 
@@ -283,7 +264,7 @@ pub struct Gatherer<'a> {
 
 impl<'a> Gatherer<'a> {
     fn new(query: &'a mut Query, embedder: &'a Embedder) -> Self {
-        let documents = Box::new(query.iter().unwrap().map(Result::unwrap));
+        let documents = Box::new(query.iter1().unwrap().map(Result::unwrap));
         Self {
             documents,
             embedder,
@@ -344,11 +325,6 @@ impl DB {
         //let connection = Connection::open_in_memory().unwrap();
         let connection = Connection::open("mydb.sqlite").unwrap();
 
-        //unsafe {
-            //let _guard = LoadExtensionGuard::new(&self.connection)?;
-            //self.connection.load_extension("trusted/sqlite/extension", None)?
-        //}
-
         println!("init");
         let query = "CREATE TABLE IF NOT EXISTS document(filename TEXT PRIMARY KEY,
             state TEXT CHECK(state IN ('new', 'indexed')),
@@ -365,7 +341,7 @@ impl DB {
     }
 
     fn make_query(self: &Self) -> SQLResult<Query> {
-        let stmt = self.connection.prepare("SELECT filename,state,hash FROM document WHERE state = 'new'
+        let stmt = self.connection.prepare("SELECT filename,hash FROM document WHERE state = 'new'
             ORDER BY filename")?;
         Ok(Query { stmt })
     }
@@ -408,12 +384,11 @@ impl DB {
 }
 
 impl<'connection> Query<'connection> {
-    fn iter(&mut self) -> SQLResult<impl Iterator<Item = SQLResult<Document>> + '_> {
+    fn iter1(&mut self) -> SQLResult<impl Iterator<Item = SQLResult<Document>> + '_> {
         self.stmt.query_map([], |row| {
             Ok(Document {
                 filename: row.get(0)?,
-                state: row.get(1)?,
-                hash: row.get(2)?,
+                hash: row.get(1)?,
             })
         })
     }
