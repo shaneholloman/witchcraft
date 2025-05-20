@@ -363,9 +363,8 @@ impl<'a> Iterator for Gatherer<'a> {
                     let utf8 = std::str::from_utf8(&buffer[..bytes_read]).unwrap();
                     let embeddings = self.embedder.embed(utf8);
                     println!("embedder took {} ms.", now.elapsed().as_millis());
-                    let normalized = normalize_l2(&embeddings.unwrap());
 
-                    let split = split_tensor(&normalized.ok()?.get(0).ok()?);
+                    let split = split_tensor(&embeddings.ok()?.get(0).ok()?);
                     doc_embedding.extend(split);
                 }
                 Some((hash, stack_tensors(doc_embedding)))
