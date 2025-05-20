@@ -582,13 +582,9 @@ fn usage(arg0: &String) {
 
 fn main() -> Result<()> {
 
-    let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        usage(&args[0]);
-    }
     let device = Device::Cpu;
-
     let embedder = Embedder::new();
+
     let db = DB::new();
     let mut query = db.make_query()?;
     let mut kmeans_query = db.make_kmeans_query()?;
@@ -596,19 +592,21 @@ fn main() -> Result<()> {
     let mut bucket_query = db.make_bucket_embeddings_query()?;
     let mut center_query = db.make_bucket_center_query()?;
 
-    register_documents(&db, "documents").unwrap();
-
-    let embedding_iter = Gatherer::new(&mut query, &embedder);
-    for (hash, embeddings) in embedding_iter {
-        //println!("for hash {} {:?}", hash, embeddings.dims2().unwrap());
-        //let (b, n) = embeddings.dims2().unwrap();
-        let vec = embeddings.to_vec1::<f32>();
-        let bytes = vec_f32_to_u8_vec(&vec?);
-        db.add_chunk(&hash, &bytes).unwrap();
-    }
-
-    let mut document_indices = Vec::<u32>::new();
+    let args: Vec<String> = env::args().collect();
     if args.len() == 2 && args[1] == "index" {
+
+        register_documents(&db, "documents").unwrap();
+
+        let embedding_iter = Gatherer::new(&mut query, &embedder);
+        for (hash, embeddings) in embedding_iter {
+            println!("for hash {} {:?}", hash, embeddings.dims2().unwrap());
+            //let (b, n) = embeddings.dims2().unwrap();
+            let vec = embeddings.flatten_all()?.to_vec1::<f32>()?;
+            let bytes = vec_f32_to_u8_vec(&vec);
+            db.add_chunk(&hash, &bytes).unwrap();
+        }
+
+        let mut document_indices = Vec::<u32>::new();
         let mut all_embeddings = vec![];
         let mut total = 0;
         for (document_idx, result) in kmeans_query.iter2()?.enumerate() {
@@ -650,9 +648,6 @@ fn main() -> Result<()> {
         let centers = stack_tensors(centers);
 
         let qe = embedder.embed(q)?.get(0)?;
-        //let qe = embedder.embed("what are the benefits of breast feeding?")?.get(0)?;
-        //let qe = embedder.embed("does milk drinking increase risk of acne in teenagers?")?.get(0)?;
-        //let qe = embedder.embed("do buildings grow in sunshine?")?.get(0)?;
         match_centroids(&mut bucket_sizes_query, &mut bucket_query, &qe, &centers).unwrap();
     } else {
         usage(&args[0]);
