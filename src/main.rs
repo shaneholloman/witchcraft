@@ -13,6 +13,9 @@ use indicatif::ProgressBar;
 
 mod t5;
 
+mod packops;
+use packops::TensorPackOps;
+
 use anyhow::{Error as E, Result};
 use candle_core::{DType, Device, Tensor, D, IndexOp};
 use candle_nn::VarBuilder;
@@ -136,14 +139,12 @@ fn write_buckets(db: &DB,
         let zp = (qmax - qmin) / 2.0;
         let residuals = ((&residuals * scale1)? + zp)?.round()?.clamp(qmin, qmax)?;
 
-        let vec = center.to_vec1::<f32>().unwrap();
-        let center_bytes = vec_f32_to_u8_vec(&vec);
+        let center_bytes = center.to_f32_bytes()?;
 
         let document_subset = document_indices.index_select(&data_indices, 0)?;
-        let vec = document_subset.to_vec1::<u32>().unwrap();
-        let indices_bytes = vec_u32_to_u8_vec(&vec);
+        let indices_bytes = document_subset.to_u32_bytes()?;
 
-        let residuals_bytes = residuals.to_4bit_u8()?;
+        let residuals_bytes = residuals.to_q4_bytes()?;
 
         db.add_bucket(i as u32, &center_bytes, &indices_bytes, &residuals_bytes).unwrap();
         bar.inc(1);
@@ -213,7 +214,7 @@ fn match_centroids(
 
         let document_indices = u8_to_vec_u32(&document_indices);
 
-        let residuals = Tensor::from_4bit_u8(&document_embeddings, 128, &device).unwrap();
+        let residuals = Tensor::from_q4_bytes(&document_embeddings, 128, &device).unwrap();
         let qmin = 0.0;
         let qmax = 15.0;
         let scale2 = 2.0 / 16.0;
@@ -545,117 +546,7 @@ impl<'connection> Query<'connection> {
     }
 }
 
-fn vec_f32_to_u8_vec(data: &Vec<f32>) -> Vec<u8> {
-    let mut bytes = vec![];
-    for &val in data {
-        bytes.extend(&val.to_ne_bytes()); // native-endian encoding
-    }
-    bytes
-}
-
-fn vec_u32_to_u8_vec(data: &Vec<u32>) -> Vec<u8> {
-    let mut bytes = vec![];
-    for &val in data {
-        bytes.extend_from_slice(&val.to_ne_bytes()); // native-endian encoding
-    }
-    bytes
-}
-
-pub trait TensorBitOps {
-    fn from_4bit_u8(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
-    fn to_4bit_u8(&self) -> Result<Vec<u8>>;
-}
-
-impl TensorBitOps for Tensor {
-
-    fn from_4bit_u8(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
-        let mut out = Vec::with_capacity(bytes.len() * 2);
-        for &byte in bytes {
-            let high = (byte >> 4) & 0x0f;
-            let low = byte & 0x0f;
-            out.push(high as f32);
-            out.push(low as f32);
-        }
-
-        assert!(
-            out.len() % cols == 0,
-            "Unpacked data length ({}) must be divisible by cols ({})",
-            out.len(),
-            cols
-        );
-        let rows = out.len() / cols;
-        Ok(Tensor::from_vec(out, &[rows, cols], device)?)
-    }
-
-    fn to_4bit_u8(&self) -> Result<Vec<u8>> {
-        let data = self.to_vec2::<f32>().unwrap();
-        let flat: Vec<f32> = data.into_iter().flatten().collect();
-
-        assert!(
-            flat.len() % 2 == 0,
-            "Tensor must have an even number of elements to pack"
-        );
-
-        let mut packed = Vec::with_capacity(flat.len() / 2);
-        for chunk in flat.chunks(2) {
-            let high = chunk[0] as u8 & 0x0f;
-            let low = chunk[1] as u8 & 0x0f;
-            packed.push((high << 4) | low);
-        }
-        Ok(packed)
-    }
-}
-
-pub fn u8_to_tensor2d_f32(bytes: &[u8], cols: usize) -> Tensor {
-    let f32_size = size_of::<f32>();
-
-    assert!(bytes.len() % f32_size == 0);
-    let total_f32s = bytes.len() / f32_size;
-
-    let rows = total_f32s / cols;
-
-    let mut f32s = Vec::with_capacity(total_f32s);
-    for chunk in bytes.chunks_exact(f32_size) {
-        let arr: [u8; 4] = chunk.try_into().unwrap();
-        f32s.push(f32::from_ne_bytes(arr));
-    }
-
-    Tensor::from_vec(f32s, (rows, cols), &Device::Cpu).unwrap()
-}
-
-pub fn u8_to_tensor2d_u32(bytes: &[u8], cols: usize) -> Tensor {
-    let u32_size = size_of::<u32>();
-
-    assert!(bytes.len() % u32_size == 0);
-    let total_u32s = bytes.len() / u32_size;
-
-    let rows = total_u32s / cols;
-
-    let mut u32s = Vec::with_capacity(total_u32s);
-    for chunk in bytes.chunks_exact(u32_size) {
-        let arr: [u8; 4] = chunk.try_into().unwrap();
-        u32s.push(u32::from_ne_bytes(arr));
-    }
-
-    Tensor::from_vec(u32s, (rows, cols), &Device::Cpu).unwrap()
-}
-
-pub fn u8_to_tensor2d_u32_1d(bytes: &[u8]) -> Tensor {
-    let u32_size = size_of::<u32>();
-
-    assert!(bytes.len() % u32_size == 0);
-    let total_u32s = bytes.len() / u32_size;
-
-    let mut u32s = Vec::with_capacity(total_u32s);
-    for chunk in bytes.chunks_exact(u32_size) {
-        let arr: [u8; 4] = chunk.try_into().unwrap();
-        u32s.push(u32::from_ne_bytes(arr));
-    }
-
-    Tensor::from_vec(u32s, total_u32s, &Device::Cpu).unwrap()
-}
-
-pub fn u8_to_vec_u32(bytes: &[u8]) -> Vec<u32> {
+fn u8_to_vec_u32(bytes: &[u8]) -> Vec<u32> {
     let u32_size = size_of::<u32>();
 
     assert!(bytes.len() % u32_size == 0);
@@ -692,8 +583,7 @@ fn main() -> Result<()> {
         let embedding_iter = Gatherer::new(&mut query, &embedder);
         for (hash, embeddings) in embedding_iter {
             println!("for hash {} {:?}", hash, embeddings.dims2().unwrap());
-            let vec = embeddings.flatten_all()?.to_vec1::<f32>()?;
-            let bytes = vec_f32_to_u8_vec(&vec);
+            let bytes = embeddings.to_f32_bytes()?;
             db.add_chunk(&hash, &bytes).unwrap();
         }
 
@@ -704,7 +594,7 @@ fn main() -> Result<()> {
         for result in kmeans_query.iter2()? {
             let (id, _filename, _hash, embedding) = result?;
             //println!("id={} filename={}", id, _filename);
-            let t = u8_to_tensor2d_f32(&embedding, 128);
+            let t = Tensor::from_f32_bytes(&embedding, 128, &Device::Cpu)?;
             let split = split_tensor(&t);
             all_embeddings.extend(split);
             let (m, _n) = t.dims2()?;
@@ -738,11 +628,10 @@ fn main() -> Result<()> {
 
         let mut centers = vec![];
         for center in center_query.iter4()? {
-            let t = u8_to_tensor2d_f32(&center?, 128);
-            let split = split_tensor(&t);
-            centers.extend(split);
+            let t = Tensor::from_f32_bytes(&center?, 128, &Device::Cpu)?.flatten_all()?;
+            centers.push(t);
         }
-        let centers = Tensor::cat(&centers, 0)?;
+        let centers = Tensor::stack(&centers, 0)?;
 
         let qe = embedder.embed(q)?.get(0)?;
         match_centroids(&mut bucket_sizes_query, &mut bucket_query, &mut body_query, &qe, &centers).unwrap();
