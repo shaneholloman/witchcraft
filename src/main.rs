@@ -259,7 +259,10 @@ fn match_centroids(
     println!("scoring clusters took {} ms.", now.elapsed().as_millis());
     println!("");
 
-    let mut results = heap2.into_vec();
+    let mut results = vec![];
+    while let Some((score, idx)) = heap2.pop() {
+        results.push((score, idx));
+    }
     results.reverse();
 
     for (score_as_u32, idx) in results {
