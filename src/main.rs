@@ -149,12 +149,15 @@ fn match_centroids(
         bucket_query: &mut Query,
         body_query: &mut Query,
         query_embeddings: &Tensor,
-        centers: &Tensor) -> Result<()> {
-    println!("******************** LOOKUP **********************\n");
+        centers: &Tensor,
+        report: bool) -> Result<()> {
     let now = std::time::Instant::now();
 
-    let k = 16;
-    let t_prime = 10000;
+    let k = 32;
+    let t_prime = 40000;
+
+    let cutoff = if report { 0.8 } else { 0.0 };
+    let top_k = if report { 10 } else { 100 };
 
     let sizes = bucket_sizes_query.u32_vec()?;
 
@@ -229,10 +232,10 @@ fn match_centroids(
 
         if last != idx || heap.len() == 0 {
             let score = current.mean(0)?.to_scalar::<f32>()?;
-            if score >= 0.8 {
+            if score >= cutoff {
                 let score_as_u32 = (1000.0 * score) as u32;
                 let elem = (score_as_u32, last);
-                if heap2.len() < 10 {
+                if heap2.len() < top_k {
                     heap2.push(elem);
                 } else {
                     let min = heap2.peek().unwrap();
@@ -263,10 +266,13 @@ fn match_centroids(
     results.reverse();
 
     for (score_as_u32, idx) in results {
-        println!("================= score:{} ============", (score_as_u32 as f32) / 1000.0);
         let body = body_query.point4(idx)?;
-        println!("{}", body);
-        println!("");
+
+        if report {
+            println!("================= score:{} ============", (score_as_u32 as f32) / 1000.0);
+            println!("{}", body);
+            println!("");
+        }
     }
 
     Ok(())
@@ -627,7 +633,7 @@ fn main() -> Result<()> {
         let centers = Tensor::stack(&centers, 0)?;
 
         let qe = embedder.embed(q)?.get(0)?;
-        match_centroids(&mut bucket_sizes_query, &mut bucket_query, &mut body_query, &qe, &centers).unwrap();
+        match_centroids(&mut bucket_sizes_query, &mut bucket_query, &mut body_query, &qe, &centers, true).unwrap();
     } else {
         usage(&args[0]);
     }
