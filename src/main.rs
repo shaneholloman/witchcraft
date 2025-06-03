@@ -642,7 +642,6 @@ fn main() -> Result<()> {
     let embedder = Embedder::new(&device);
 
     let db = DB::new("mydb.sqlite");
-    let mut query = db.make_query().unwrap();
     let mut kmeans_query = db.make_kmeans_query().unwrap();
 
     let mut center_query = db.make_bucket_center_query().unwrap();
@@ -659,17 +658,17 @@ fn main() -> Result<()> {
 
         read_csv(&db, &args[2]).unwrap();
 
-    } else if args.len() == 2 && &args[1] == "index" {
+    } else if args.len() == 2 && &args[1] == "embed" {
 
-/*
+        let mut query = db.make_query().unwrap();
         let embedding_iter = Gatherer::new(&mut query, &embedder);
         for (hash, embeddings) in embedding_iter {
             println!("for hash {} {:?}", hash, embeddings.dims2().unwrap());
             let bytes = embeddings.to_f32_bytes()?;
             db.add_chunk(&hash, &bytes).unwrap();
         }
-        */
 
+    } else if args.len() == 2 && &args[1] == "index" {
 
         let chunks_count = db.query("SELECT count(hash) FROM chunk")?.point((), |row| {
                 Ok( row.get::<_, f32>(0)?,)
