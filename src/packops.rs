@@ -7,12 +7,11 @@ pub trait TensorPackOps {
     fn inv_compand(&self) -> Result<Tensor>;
     fn quantize(&self, bits: u32) -> Result<Tensor>;
     fn dequantize(&self, bits: u32) -> Result<Tensor>;
-    fn from_q4_bytes(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
+    //fn from_q4_bytes(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
     fn from_companded_q4_bytes(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
     fn from_f32_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
     fn to_q4_bytes(&self) -> Result<Vec<u8>>;
     fn to_f32_bytes(&self) -> Result<Vec<u8>>;
-    fn to_u32_bytes(&self) -> Result<Vec<u8>>;
 }
 
 impl TensorPackOps for Tensor {
@@ -62,6 +61,7 @@ impl TensorPackOps for Tensor {
         Ok(((self - zp)? * scale2)?)
     }
 
+    /*
     fn from_q4_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
         let mut out = Vec::with_capacity(bytes.len() * 2);
         for &byte in bytes {
@@ -80,6 +80,7 @@ impl TensorPackOps for Tensor {
         let rows = out.len() / cols;
         Ok(Tensor::from_vec(out, &[rows, cols], device)?)
     }
+    */
 
     fn from_f32_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
         let f32_size = size_of::<f32>();
@@ -132,16 +133,6 @@ impl TensorPackOps for Tensor {
         Ok(bytes)
     }
 
-    fn to_u32_bytes(&self) -> Result<Vec<u8>> {
-        let ulongs: Vec<u32> = self.to_vec1::<u32>()?;
-        let mut bytes = Vec::with_capacity(ulongs.len() * 4);
-
-        for u in ulongs {
-            bytes.extend_from_slice(&u.to_ne_bytes());
-        }
-        Ok(bytes)
-    }
-
     fn from_companded_q4_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
         let x = Tensor::arange(0.0f32, 16.0f32, &Device::Cpu)?;
         let x = x.dequantize(4)?.inv_compand()?;
@@ -183,6 +174,7 @@ mod tests {
         println!("x={}", x);
         Ok(())
     }
+    #[test]
     fn test_compand() -> Result<()> {
         let x1 = Tensor::randn(0f32, 0.26f32, 200, &Device::Cpu)?;
         let x2 = x1.compand()?.inv_compand()?;

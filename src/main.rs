@@ -1,5 +1,4 @@
 use std::env;
-use rand::prelude::*;
 use rusqlite::{Connection, Statement, Row, Result as SQLResult};
 use sha2::{Sha256, Digest};
 use min_heap::MinHeap;
@@ -139,8 +138,7 @@ fn write_buckets(db: &DB,
 
     let mut done = false;
     let mut batch = 0;
-    let mut batches = 0;
-    let mut slice = 0;
+    let mut tmpfiles = vec![];
     let centers_cpu = centers.to_device(&Device::Cpu)?;
     while !done {
         match results.next() {
@@ -159,15 +157,13 @@ fn write_buckets(db: &DB,
                 if batch >= 0x10000 {
                     let now = std::time::Instant::now();
                     let data = Tensor::cat(&all_embeddings, 0)?.to_device(&device).unwrap();
-                    let data_cpu = Tensor::cat(&all_embeddings, 0)?.to_device(&Device::Cpu).unwrap();
 
                     let sim = data.matmul(&centers.transpose(D::Minus1, D::Minus2)?)?;
                     let cluster_assignments = sim.argmax(D::Minus1)?.to_device(&Device::Cpu)?;
                     mmuls_total += now.elapsed().as_millis();
 
                     let now = std::time::Instant::now();
-                    let mut writer = merger::Writer::new_with_suffix("dump", slice).unwrap();
-                    slice += 1;
+                    let mut writer = merger::Writer::new().unwrap();
 
                     let mut pairs: Vec<(usize, u32)> = cluster_assignments
                         .to_vec1::<u32>()?
@@ -177,16 +173,14 @@ fn write_buckets(db: &DB,
                         .collect();
                     pairs.sort_by_key(|&(_, bucket)| bucket);
 
-                    let mut center = Tensor::zeros((128,), DType::F32, &Device::Cpu)?;
                     let mut indices_bytes: Vec<u8> = Vec::with_capacity(batch * 4);
                     let mut residuals_bytes: Vec<u8> = Vec::with_capacity(batch * 64);
                     let n = pairs.len();
                     let (_, mut prev_bucket) = pairs[0];
                     let mut count = 0;
-                    let mut i = 0;
                     let mut done = false;
 
-                    loop {
+                    for i in 0.. {
                         let (sample, bucket) = if i < n {
                             pairs[i]
                         } else {
@@ -210,22 +204,19 @@ fn write_buckets(db: &DB,
  
                         let doc_idx = document_indices[sample];
                         indices_bytes.extend_from_slice(&doc_idx.to_ne_bytes());
-                        center = centers_cpu.get(bucket as usize)?;
-                        let residual = (data_cpu.get(sample)? - &center)?;
+                        let center = centers_cpu.get(bucket as usize)?;
+                        let residual = (all_embeddings[sample].get(0) - &center)?;
                         let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
                         residuals_bytes.extend(&residual_quantized);
                         count += 1;
-
-                        i += 1;
                     }
-                    writer.finish().unwrap();
+                    tmpfiles.push(writer.finish()?);
                     writes_total += now.elapsed().as_millis();
                     bar.inc(batch as u64);
 
                     document_indices.clear();
                     all_embeddings.clear();
                     batch = 0;
-                    batches += 1;
                 }
 
             }
@@ -238,7 +229,7 @@ fn write_buckets(db: &DB,
     println!("mmuls took {} ms.", mmuls_total);
     println!("writes took {} ms.", writes_total);
     println!("merge all");
-    let mut merger = merger::Merger::new("dump", batches).unwrap();
+    let mut merger = merger::Merger::from_tempfiles(tmpfiles)?;
     for result in &mut merger {
         let entry = result?;
         let center = centers_cpu.get(entry.value as usize)?;
