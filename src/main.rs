@@ -2,6 +2,7 @@ use std::env;
 use rusqlite::{Connection, Statement, Row, Result as SQLResult};
 use sha2::{Sha256, Digest};
 use min_heap::MinHeap;
+use std::collections::HashMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, Read, BufWriter, Write};
@@ -239,13 +240,35 @@ fn write_buckets(db: &DB,
     Ok(())
 }
 
+fn reciprocal_rank_fusion(
+    list1: &[u32],
+    list2: &[u32],
+    k: f64,
+) -> Vec<(u32, f64)> {
+    let mut scores: HashMap<u32, f64> = HashMap::new();
+
+    for (rank, &doc_id) in list1.iter().enumerate() {
+        let score = 1.0 / (k + rank as f64);
+        *scores.entry(doc_id).or_insert(0.0) += score;
+    }
+
+    for (rank, &doc_id) in list2.iter().enumerate() {
+        let score = 1.0 / (k + rank as f64);
+        *scores.entry(doc_id).or_insert(0.0) += score;
+    }
+
+    let mut results: Vec<(u32, f64)> = scores.into_iter().collect();
+    results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); // Sort descending by score
+    results
+}
+
+
 fn match_centroids(
         bucket_sizes_query: &mut Query,
         bucket_query: &mut Query,
-        body_query: &mut Query,
         query_embeddings: &Tensor,
         centers: &Tensor,
-        report: bool) -> Result<Vec<String>> {
+        report: bool) -> Result<Vec<(f32, u32)>> {
     let now = std::time::Instant::now();
 
     let k = 32;
@@ -373,34 +396,12 @@ fn match_centroids(
     println!("scoring {} documents took {} ms.", unique_docs, now.elapsed().as_millis());
     println!("");
 
-    let mut filenames = vec![];
     let mut results = vec![];
-    while let Some((score, idx)) = heap2.pop() {
-        results.push((score, idx));
+    while let Some((score_as_u32, idx)) = heap2.pop() {
+        results.push((score_as_u32 as f32 / 1000.0, idx));
     }
     results.reverse();
-
-    for (score_as_u32, idx) in results {
-
-        let (filename, body) = body_query.point((idx,), |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-            ))
-        })?;
-
-        if report {
-            println!("================= score:{} ============", (score_as_u32 as f32) / 1000.0);
-            println!("{}", body);
-            println!("");
-        }
-
-        filenames.push(filename);
-
-    }
-    //println!("filenames {:?}", filenames);
-
-    Ok(filenames)
+    Ok(results)
 }
 
 fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
@@ -577,10 +578,17 @@ impl DB {
         let connection = Connection::open(db_fn).unwrap();
         connection.pragma_update(None, "synchronous", "OFF").unwrap();
 
-        println!("init");
         let query = "CREATE TABLE IF NOT EXISTS document(filename TEXT PRIMARY KEY,
             hash TEXT NOT NULL, body TEXT, UNIQUE(filename, hash))";
         connection.execute(query, ()).unwrap();
+
+        let query = "CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(body, content='document', content_rowid='rowid')";
+        connection.execute(query, ()).unwrap();
+
+        println!("rebuild...");
+        let query = "INSERT INTO document_fts(document_fts) VALUES('rebuild')";
+        connection.execute(query, ()).unwrap();
+        println!("rebuild done");
 
         let query = "CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY NOT NULL, embedding BLOB NOT NULL)";
         connection.execute(query, ()).unwrap();
@@ -719,7 +727,7 @@ fn u8_to_vec_u32(bytes: &[u8]) -> Vec<u32> {
 }
 
 fn usage(arg0: &String) {
-    eprintln!("Usage: {} scan | readcsv <file> | index | query <text> | querycsv <file> <results-file>", arg0);
+    eprintln!("Usage: {} scan | readcsv <file> | embed | index | query <text> | hybrid <text> | querycsv <file> <results-file>", arg0);
     std::process::exit(1)
 }
 
@@ -803,11 +811,51 @@ fn main() -> Result<()> {
         write_buckets(&db, &centers, &device).unwrap();
         println!("write buckets took {} ms.", now.elapsed().as_millis());
 
-    } else if args.len() >= 3 && args[1] == "query" {
+    } else if args.len() >= 3 && args[1] == "fts" {
 
         let q = &args[2..].join(" ");
-        println!("Looking up: {}", q);
+        println!("Doing full text search for: {}", q);
 
+        let mut query = db.query("SELECT rowid,body,bm25(document_fts) AS score
+            FROM document_fts
+            WHERE document_fts MATCH ?1 ORDER BY score")?;
+        let results = query.iter((&q,), |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })?;
+        for result in results {
+            let (rowid, body) = result?;
+            println!("match in {} {}", rowid, body);
+
+
+        }
+
+
+    } else if args.len() >= 3 && (args[1] == "query" || args[1] == "hybrid") {
+
+        let q = &args[2..].join(" ");
+        let mut fts_idxs = vec![];
+
+        if args[1] == "hybrid" {
+            println!("Doing full text search for: {}", q);
+            let mut query = db.query("SELECT rowid,bm25(document_fts) AS score
+                FROM document_fts
+                WHERE document_fts MATCH ?1 ORDER BY score")?;
+            let results = query.iter((&q,), |row| {
+                    Ok((
+                        row.get::<_, u32>(0)?,
+                    ))
+                })?;
+            for result in results {
+                let (rowid, ) = result?;
+                fts_idxs.push(rowid);
+            }
+            println!("full text found {} matches", fts_idxs.len());
+        }
+
+        println!("Doing semantic search for: {}", q);
         let mut centers = vec![];
         for center in center_query.iter((), |row| {
             Ok( row.get::<_, Vec<u8>>(0)? )
@@ -818,7 +866,24 @@ fn main() -> Result<()> {
         let centers = Tensor::stack(&centers, 0)?;
 
         let qe = embedder.embed(q)?.get(0)?;
-        match_centroids(&mut bucket_sizes_query, &mut bucket_query, &mut body_query, &qe, &centers, true).unwrap();
+        let sem_matches = match_centroids(&mut bucket_sizes_query, &mut bucket_query, &qe, &centers, true).unwrap();
+        let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
+        println!("semantic search found {} matches", fts_idxs.len());
+
+        let fused = reciprocal_rank_fusion(&fts_idxs, &sem_idxs, 60.0);
+
+        for (idx, _score) in fused {
+            let (_, body) = body_query.point((idx,), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            })?;
+
+            println!("=============================");
+            println!("{}", body);
+            println!("");
+        }
 
     } else if args.len() >= 4 && args[1] == "querycsv" {
 
@@ -845,11 +910,22 @@ fn main() -> Result<()> {
             let question = record.1;
 
             let qe = embedder.embed(&question)?.get(0)?;
-            let results = match_centroids(&mut bucket_sizes_query, &mut bucket_query, &mut body_query, &qe, &centers, false).unwrap();
+            let results = match_centroids(&mut bucket_sizes_query, &mut bucket_query, &qe, &centers, false).unwrap();
+
+            let mut filenames = vec![];
+            for (_score, idx) in results {
+                let (filename, _) = body_query.point((idx,), |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                    ))
+                })?;
+                filenames.push(filename);
+            }
 
             write!(writer, "{}\t", key).unwrap();
-            for s in &results {
-                write!(writer, "{},", s).unwrap();
+            for filename in &filenames {
+                write!(writer, "{},", filename).unwrap();
             }
             write!(writer, "\n").unwrap();
             writer.flush().unwrap();
