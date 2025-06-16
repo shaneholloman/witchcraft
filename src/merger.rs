@@ -60,7 +60,7 @@ impl Merger {
         let mut heap = BinaryHeap::new();
         for (i, reader) in readers.iter_mut().enumerate() {
             if let Some(record) = read_record(reader)? {
-                heap.push(HeapEntry { record, source: i });
+                heap.push(HeapEntry { record, source_index: i });
             }
         }
 
@@ -73,36 +73,35 @@ impl Iterator for Merger {
 
     fn next(&mut self) -> Option<Self::Item> {
         let current = self.heap.pop()?;
-
         let mut combined_tags = current.record.tags;
         let mut combined_data = current.record.data;
 
-        // Merge all records with the same value
         while let Some(next) = self.heap.peek() {
             if next.record.value != current.record.value {
                 break;
             }
 
-            let next = self.heap.pop().unwrap();
-            combined_tags.extend(next.record.tags);
-            combined_data.extend(next.record.data);
+            let HeapEntry { record, source_index } = self.heap.pop().unwrap();
+            combined_tags.extend(record.tags);
+            combined_data.extend(record.data);
 
-            if let Some(record) = match read_record(&mut self.readers[next.source]) {
-                Ok(Some(r)) => Some(r),
-                Ok(None) => None,
+            match read_record(&mut self.readers[source_index]) {
+                Ok(Some(following)) => self.heap.push(HeapEntry {
+                    record: following,
+                    source_index,
+                }),
+                Ok(None) => (),
                 Err(e) => return Some(Err(e)),
-            } {
-                self.heap.push(HeapEntry { record, source: next.source });
             }
         }
 
-        // Refill from source of current
-        if let Some(record) = match read_record(&mut self.readers[current.source]) {
-            Ok(Some(r)) => Some(r),
-            Ok(None) => None,
+        match read_record(&mut self.readers[current.source_index]) {
+            Ok(Some(next_record)) => self.heap.push(HeapEntry {
+                record: next_record,
+                source_index: current.source_index,
+            }),
+            Ok(None) => (),
             Err(e) => return Some(Err(e)),
-        } {
-            self.heap.push(HeapEntry { record, source: current.source });
         }
 
         Some(Ok(MergedEntry {
@@ -124,7 +123,7 @@ struct Record {
 
 struct HeapEntry {
     record: Record,
-    source: usize,
+    source_index: usize,
 }
 
 impl Ord for HeapEntry {
