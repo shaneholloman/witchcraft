@@ -585,11 +585,7 @@ impl<'a> Iterator for Gatherer<'a> {
         let mut doc_embedding = vec![];
         match self.documents.next() {
             Some((hash, body)) => {
-
-                let now = std::time::Instant::now();
                 let embeddings = self.embedder.embed(&body).unwrap();
-                println!("embedder took {} ms.", now.elapsed().as_millis());
-
                 let split = split_tensor(&embeddings.get(0).ok()?);
                 doc_embedding.extend(split);
                 Some((hash, Tensor::cat(&doc_embedding, 0).unwrap()))
