@@ -361,7 +361,14 @@ fn match_centroids(
 
     let mut all_document_embeddings = vec![];
     for i in topk_clusters {
-        let (document_indices, document_embeddings) = bucket_query.point3(cluster_ids[i as usize])?;
+        //let (document_indices, document_embeddings) = bucket_query.point3(cluster_ids[i as usize])?;
+        let (document_indices, document_embeddings) = bucket_query.point((cluster_ids[i as usize], ), |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                ))
+            })?;
+
         let center = centers.get(i as usize)?;
 
         let document_indices = u8_to_vec_u32(&document_indices);
@@ -556,7 +563,13 @@ pub struct Gatherer<'a> {
 
 impl<'a> Gatherer<'a> {
     fn new(query: &'a mut Query, embedder: &'a Embedder) -> Self {
-        let documents = Box::new(query.iter1().unwrap().map(Result::unwrap));
+        let documents = Box::new(query.iter((), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                ))
+            }).unwrap().map(Result::unwrap));
+
         Self {
             documents,
             embedder,
@@ -679,7 +692,6 @@ impl DB {
 }
 
 impl<'connection> Query<'connection> {
-
     fn iter<'stmt, T1, T2, F>(&'stmt mut self, args: T1, map_fn: F) -> SQLResult<impl Iterator<Item = SQLResult<T2>> + 'stmt>
         where
             F: FnMut(&Row) -> SQLResult<T2> + 'stmt,
@@ -687,31 +699,10 @@ impl<'connection> Query<'connection> {
         self.stmt.query_map(args, map_fn)
     }
 
-
-
     fn point<'stmt, T1, T2, F>(&'stmt mut self, args: T1, map_fn: F) -> SQLResult<T2>
         where F: FnOnce(&Row) -> SQLResult<T2> + 'stmt, T1: rusqlite::Params,
     {
         self.stmt.query_row(args, map_fn)
-    }
-
-
-    fn iter1(&mut self) -> SQLResult<impl Iterator<Item = SQLResult<(String, String)>> + '_> {
-        self.stmt.query_map([], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-            ))
-        })
-    }
-
-    fn point3(&mut self, id: u32) -> SQLResult<(Vec<u8>, Vec<u8>)> {
-        self.stmt.query_row([id], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-            ))
-        })
     }
 }
 
