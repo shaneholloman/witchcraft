@@ -117,8 +117,9 @@ fn write_buckets(db: &DB,
     let mut writes_total = 0;
 
     let embeddings_count = db.query("SELECT sum(length(embedding)/128) FROM chunk")?.point((), |row| {
-            Ok( row.get::<_, f32>(0)?,)
+            Ok( row.get::<_, u32>(0)?,)
         }).unwrap();
+    assert!(embeddings_count > 0);
     let bar = ProgressBar::new(embeddings_count as u64);
 
     //let mut document_indices = vec![];
@@ -141,6 +142,7 @@ fn write_buckets(db: &DB,
     let mut tmpfiles = vec![];
     let centers_cpu = centers.to_device(&Device::Cpu)?;
     while !done {
+
         match results.next() {
             Some(result) => {
                 let (id, embedding) = result?;
@@ -148,81 +150,79 @@ fn write_buckets(db: &DB,
                 let split = split_tensor(&t);
                 let m = split.len();
                 all_embeddings.extend(split);
-
                 for _ in 0..m {
                     document_indices.push(id as u32);
                 }
                 batch += m;
-
-                if batch >= 0x10000 {
-                    let now = std::time::Instant::now();
-                    let data = Tensor::cat(&all_embeddings, 0)?.to_device(&device).unwrap();
-
-                    let sim = data.matmul(&centers.transpose(D::Minus1, D::Minus2)?)?;
-                    let cluster_assignments = sim.argmax(D::Minus1)?.to_device(&Device::Cpu)?;
-                    mmuls_total += now.elapsed().as_millis();
-
-                    let now = std::time::Instant::now();
-                    let mut writer = merger::Writer::new().unwrap();
-
-                    let mut pairs: Vec<(usize, u32)> = cluster_assignments
-                        .to_vec1::<u32>()?
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &bucket)| (i, bucket))
-                        .collect();
-                    pairs.sort_by_key(|&(_, bucket)| bucket);
-
-                    let mut indices_bytes: Vec<u8> = Vec::with_capacity(batch * 4);
-                    let mut residuals_bytes: Vec<u8> = Vec::with_capacity(batch * 64);
-                    let n = pairs.len();
-                    let (_, mut prev_bucket) = pairs[0];
-                    let mut count = 0;
-                    let mut done = false;
-
-                    for i in 0.. {
-                        let (sample, bucket) = if i < n {
-                            pairs[i]
-                        } else {
-                            done = true;
-                            (0, std::u32::MAX)
-                        };
-
-                        if  (bucket != prev_bucket || done) && count > 0 {
-                            assert!(prev_bucket < bucket);
-                            writer.write_record(prev_bucket, count, &indices_bytes, &residuals_bytes)?;
-
-                            indices_bytes.clear();
-                            residuals_bytes.clear();
-                            prev_bucket = bucket;
-                            count = 0;
-                        }
-
-                        if done {
-                            break;
-                        }
- 
-                        let doc_idx = document_indices[sample];
-                        indices_bytes.extend_from_slice(&doc_idx.to_ne_bytes());
-                        let center = centers_cpu.get(bucket as usize)?;
-                        let residual = (all_embeddings[sample].get(0) - &center)?;
-                        let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
-                        residuals_bytes.extend(&residual_quantized);
-                        count += 1;
-                    }
-                    tmpfiles.push(writer.finish()?);
-                    writes_total += now.elapsed().as_millis();
-                    bar.inc(batch as u64);
-
-                    document_indices.clear();
-                    all_embeddings.clear();
-                    batch = 0;
-                }
-
             }
             None => {
                 done = true;
             }
+        }
+
+        if batch >= 0x10000 || done {
+            let now = std::time::Instant::now();
+            let data = Tensor::cat(&all_embeddings, 0)?.to_device(&device).unwrap();
+
+            let sim = data.matmul(&centers.transpose(D::Minus1, D::Minus2)?)?;
+            let cluster_assignments = sim.argmax(D::Minus1)?.to_device(&Device::Cpu)?;
+            mmuls_total += now.elapsed().as_millis();
+
+            let now = std::time::Instant::now();
+            let mut writer = merger::Writer::new().unwrap();
+
+            let mut pairs: Vec<(usize, u32)> = cluster_assignments
+                .to_vec1::<u32>()?
+                .iter()
+                .enumerate()
+                .map(|(i, &bucket)| (i, bucket))
+                .collect();
+            pairs.sort_by_key(|&(_, bucket)| bucket);
+
+            let mut indices_bytes: Vec<u8> = Vec::with_capacity(batch * 4);
+            let mut residuals_bytes: Vec<u8> = Vec::with_capacity(batch * 64);
+            let n = pairs.len();
+            let (_, mut prev_bucket) = pairs[0];
+            let mut count = 0;
+            let mut bucket_done = false;
+
+            for i in 0.. {
+                let (sample, bucket) = if i < n {
+                    pairs[i]
+                } else {
+                    bucket_done = true;
+                    (0, std::u32::MAX)
+                };
+
+                if  (bucket != prev_bucket || bucket_done) && count > 0 {
+                    assert!(prev_bucket < bucket);
+                    writer.write_record(prev_bucket, count, &indices_bytes, &residuals_bytes)?;
+
+                    indices_bytes.clear();
+                    residuals_bytes.clear();
+                    prev_bucket = bucket;
+                    count = 0;
+                }
+
+                if bucket_done {
+                    break;
+                }
+
+                let doc_idx = document_indices[sample];
+                indices_bytes.extend_from_slice(&doc_idx.to_ne_bytes());
+                let center = centers_cpu.get(bucket as usize)?;
+                let residual = (all_embeddings[sample].get(0) - &center)?;
+                let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
+                residuals_bytes.extend(&residual_quantized);
+                count += 1;
+            }
+            tmpfiles.push(writer.finish()?);
+            writes_total += now.elapsed().as_millis();
+            bar.inc(batch as u64);
+
+            document_indices.clear();
+            all_embeddings.clear();
+            batch = 0;
         }
     }
     bar.finish();
@@ -318,6 +318,7 @@ fn match_centroids(
         let t = Tensor::from_f32_bytes(&center, 128, &Device::Cpu)?.flatten_all()?;
         centers.push(t);
     }
+    assert!(centers.len() > 0);
     let centers = Tensor::stack(&centers, 0)?.to_device(&device)?;
 
     let query_centroid_similarity = query_embeddings.matmul(&centers.transpose(D::Minus1, D::Minus2)?).unwrap();
