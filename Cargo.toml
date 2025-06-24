@@ -3,6 +3,9 @@ name = "warp"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
 accelerate-src = { version = "0.3.2", optional = true }
 candle-metal-kernels = { version = "0.9.1", optional = true }
@@ -19,13 +22,18 @@ tokenizers = "*"
 tracing = "*"
 serde_plain = "1.0.2"
 rand = "0.9.1"
-sqlite-vec = "0.1.6"
 rusqlite = "0.35.0"
 sha2 = "0.10.9"
 min-heap = "1.0.0"
 indicatif = "0.17.11"
 csv = "1.3.1"
 tempfile = "3.20.0"
+
+napi = { version = "3.0.0-beta.9" }
+napi-derive = { version = "3.0.0-beta.9" }
+
+[build-dependencies]
+napi-build = "1"
 
 [features]
 accelerate = ["dep:libc", "dep:accelerate-src"]
