@@ -974,7 +974,7 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
     Ok(())
 }
 
-pub fn search(db: &DB, embedder: &Embedder, q: &String, use_fulltext: bool) -> Result<Vec<String>> {
+pub fn search(db: &DB, embedder: &Embedder, q: &String, use_fulltext: bool) -> Result<Vec<(String, String)>> {
     let fts_idxs = if use_fulltext {
         println!("Doing full text search for: {}", q);
         fulltext_search(&db, &q)?
@@ -997,14 +997,10 @@ pub fn search(db: &DB, embedder: &Embedder, q: &String, use_fulltext: bool) -> R
     let mut results = vec![];
     let mut body_query = db.query("SELECT filename,body FROM document WHERE rowid = ?1")?;
     for idx in fused {
-        let (_, body) = body_query.point((idx,), |row| {
+        let (filename, body) = body_query.point((idx,), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-
-        println!("=============================");
-        println!("{}", body);
-        println!("");
-        results.push(body);
+        results.push((filename, body));
     }
     Ok(results)
 }

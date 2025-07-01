@@ -74,14 +74,23 @@ impl Warp {
         }
     }
     #[napi]
-    pub fn search(&self, q: String) -> Vec<String> {
+    pub fn search(&self, q: String) -> Vec<(String, String)> {
         warp::search(&self.db, &self.embedder, &q, true).unwrap()
     }
 
     #[napi]
     pub fn add(&self, metadata: String, body: String) {
+        println!("add {}", body);
         warp::add_doc_from_string(&self.db, &metadata, &body).unwrap();
+    }
+
+    #[napi]
+    pub fn embed(&self, metadata: String, body: String) {
         INDEXER.submit("embed".to_string());
+    }
+
+    #[napi]
+    pub fn index(&self, metadata: String, body: String) {
         INDEXER.submit("index".to_string());
     }
 }
