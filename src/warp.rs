@@ -11,6 +11,8 @@ use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::mem::size_of;
+use once_cell::sync::Lazy;
+use std::sync::RwLock;
 mod t5;
 pub mod assets;
 
@@ -297,6 +299,66 @@ fn reciprocal_rank_fusion(list1: &[u32], list2: &[u32], k: f64) -> Vec<u32> {
     results
 }
 
+struct CachedTensor {
+    version: u64,
+    cluster_ids: Vec<u32>,
+    sizes: Vec<usize>,
+    centers: Vec<Tensor>,
+    tensor: Tensor,
+}
+
+static CACHED: Lazy<RwLock<Option<CachedTensor>>> = Lazy::new(|| RwLock::new(None));
+
+fn get_centers(db: &DB, device: &Device, version: u64) -> Result<(Vec<u32>, Vec<usize>, Vec<Tensor>, Tensor)> {
+    let now = std::time::Instant::now();
+    {
+        let cache = CACHED.read().unwrap();
+        if let Some(cached) = &*cache {
+            if cached.version == version {
+                return Ok((cached.cluster_ids.clone(), cached.sizes.clone(), cached.centers.clone(), cached.tensor.clone()));
+            }
+        }
+    }
+
+    let mut center_query =
+        db.query("SELECT id,length(indices)/4,center FROM bucket ORDER BY id")?;
+    let mut cluster_ids = vec![];
+    let mut sizes = vec![];
+    let mut centers = vec![];
+    for result in center_query.iter((), |row| {
+        let id = row.get(0)?;
+        let size = row.get(1)?;
+        let blob: Vec<u8> = row.get(2)?;
+        Ok((id, size, blob))
+    })? {
+        let (id, size, center) = result?;
+        cluster_ids.push(id);
+        sizes.push(size);
+        let t = Tensor::from_f32_bytes(&center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
+        centers.push(t);
+    }
+    let tensor = if centers.len() > 0 {
+        Tensor::stack(&centers, 0)?.to_device(&device)?
+    } else {
+        Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, &device)?
+    };
+    println!(
+        "reading and stacking centers took {} ms.",
+        now.elapsed().as_millis()
+    );
+
+    let mut cache = CACHED.write().unwrap();
+    *cache = Some(CachedTensor {
+        version: version,
+        cluster_ids: cluster_ids.clone(),
+        sizes: sizes.clone(),
+        centers: centers.clone(),
+        tensor: tensor.clone(),
+    });
+
+    Ok((cluster_ids, sizes, centers, tensor))
+}
+
 fn match_centroids(
     db: &DB,
     query_embeddings: &Tensor,
@@ -310,31 +372,6 @@ fn match_centroids(
     let device = query_embeddings.device();
     let (m, n) = query_embeddings.dims2()?;
 
-    // XXX this step is quite slow. We should consider storing the centers matrix separately from
-    // the buckets
-
-    let mut center_query =
-        db.query("SELECT id,length(indices)/4,center FROM bucket ORDER BY id")?;
-    let mut bucket_query =
-        db.query("SELECT indices,residuals FROM bucket WHERE generation = ?1 and id = ?2")?;
-
-    let mut cluster_ids = vec![];
-    let mut sizes = vec![];
-    let mut centers = vec![];
-    for result in center_query.iter((), |row| {
-        Ok((
-            row.get::<_, u32>(0)?,
-            row.get::<_, usize>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
-        ))
-    })? {
-        let (id, size, center) = result?;
-        cluster_ids.push(id);
-        sizes.push(size);
-        let t = Tensor::from_f32_bytes(&center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
-        centers.push(t);
-    }
-
     let max_generation = db
         .query("SELECT MAX(generation) FROM indexed_chunk")?
         .point((), |row| Ok(row.get::<_, u32>(0)?))
@@ -345,14 +382,14 @@ fn match_centroids(
     let mut count = 0;
     let mut missing = vec![];
 
-    if centers.len() > 0 {
-        let centers_matrix = Tensor::stack(&centers, 0)?.to_device(&device)?;
+    let (cluster_ids, sizes, centers, centers_matrix) = get_centers(&db, &device, max_generation as u64)?;
 
-        println!(
-            "reading and stacking centers took {} ms.",
-            now.elapsed().as_millis()
-        );
-        let now = std::time::Instant::now();
+    let mut bucket_query =
+        db.query("SELECT indices,residuals FROM bucket WHERE generation = ?1 and id = ?2")?;
+
+    println!("readying database took {} ms.", now.elapsed().as_millis());
+
+    if centers.len() > 0 {
 
         let query_centroid_similarity = query_embeddings
             .matmul(&centers_matrix.transpose(D::Minus1, D::Minus2)?)
