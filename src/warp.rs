@@ -366,13 +366,10 @@ fn match_centroids(
     top_k: usize,
 ) -> Result<Vec<(f32, u32)>> {
 
-    let now = std::time::Instant::now();
     let max_generation = db
         .query("SELECT MAX(generation) FROM indexed_chunk")?
         .point((), |row| Ok(row.get::<_, u32>(0)?))
         .unwrap_or(0);
-
-    println!("readying database took {} ms.", now.elapsed().as_millis());
 
     let k = 32;
     let t_prime = 40000;
@@ -473,7 +470,7 @@ fn match_centroids(
         db.execute("DROP TABLE temp").unwrap();
 
         println!(
-            "reading {} indexed embeddings took {} ms.",
+            "reading in {} indexed embeddings took {} ms.",
             count,
             now.elapsed().as_millis()
         );
@@ -786,10 +783,8 @@ impl DB {
         let query = "CREATE VIRTUAL TABLE IF NOT EXISTS document_fts USING fts5(body, content='document', content_rowid='rowid')";
         connection.execute(query, ()).unwrap();
 
-        println!("rebuild...");
         let query = "INSERT INTO document_fts(document_fts) VALUES('rebuild')";
         connection.execute(query, ()).unwrap();
-        println!("rebuild done");
 
         let query = "CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY NOT NULL, embeddings BLOB NOT NULL)";
         connection.execute(query, ()).unwrap();
