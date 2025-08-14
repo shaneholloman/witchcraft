@@ -768,9 +768,9 @@ impl DB {
     pub fn new(db_fn: &str) -> Self {
         let connection = Connection::open(db_fn).unwrap();
 
-        connection
-            .pragma_update(None, "journal_mode", &"WAL")
-            .unwrap();
+        //connection
+            //.pragma_update(None, "journal_mode", &"WAL")
+            //.unwrap();
         connection.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
 
         let query = "CREATE TABLE IF NOT EXISTS document(filename TEXT PRIMARY KEY,
