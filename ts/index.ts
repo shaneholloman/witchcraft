@@ -10,7 +10,7 @@ const server = new McpServer({
 
 function doSearch(q: string): string {
     const matches = [];
-    const results = search(q, 0.75);
+    const results = search(q, 0.75, 10, "");
     for (const result of results) {
       let [_head, body] = result;
       matches.push(body);
