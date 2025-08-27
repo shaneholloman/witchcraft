@@ -1105,7 +1105,7 @@ pub fn search(
     top_k: usize,
     use_fulltext: bool,
     sql_filter: Option<&str>,
-) -> Result<Vec<(String, String)>> {
+) -> Result<Vec<(f32, String, String)>> {
     let now = std::time::Instant::now();
 
     let q = q.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1131,7 +1131,12 @@ pub fn search(
         }
     };
 
+    let mut scores: HashMap<u32, f32> = HashMap::new();
     let sem_matches = match_centroids(&db, &qe, threshold, top_k, sql_filter).unwrap();
+    for (score, idx) in &sem_matches {
+        scores.insert(*idx, *score);
+    }
+
     let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx)| idx).collect();
     println!("semantic search found {} matches", sem_idxs.len());
 
@@ -1144,10 +1149,14 @@ pub fn search(
     let mut results = vec![];
     let mut body_query = db.query("SELECT metadata,body FROM document WHERE rowid = ?1");
     for idx in fused {
+        let score = match scores.get(&idx) {
+            Some(score) => *score,
+            None => 0.0f32,
+        };
         let (metadata, body) = body_query.query_row((idx,), |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-        results.push((metadata, body));
+        results.push((score, metadata, body));
     }
     println!("search took {} ms end-to-end.", now.elapsed().as_millis());
     Ok(results)

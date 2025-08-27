@@ -36,8 +36,8 @@ fn main() -> Result<()> {
         let q = &args[2..].join(" ");
         let use_fulltext = args[1] == "hybrid";
         let results = warp::search(&db, &embedder, &mut cache, &q, 0.75, 10, use_fulltext, None).unwrap();
-        for (filename, body) in results {
-            println!("{} : {}", filename, body);
+        for (score, filename, body) in results {
+            println!("{} : {} : {}", score, filename, body);
         }
 
     } else if args.len() >= 4 && (args[1] == "querycsv" || args[1] == "hybridcsv" || args[1] == "fulltextcsv") {

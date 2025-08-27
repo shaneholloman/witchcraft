@@ -76,7 +76,7 @@ impl WarpInner {
         }
     }
 
-    pub fn search(&mut self, q: &String, threshold: f32, top_k: usize, sql_filter: &String) -> Vec<(String, String)> {
+    pub fn search(&mut self, q: &String, threshold: f32, top_k: usize, sql_filter: &String) -> Vec<(f32, String, String)> {
         let filter = if !sql_filter.is_empty() {
             Some(sql_filter.as_str())
         } else {
@@ -120,25 +120,28 @@ pub struct SearchTask {
 }
 
 impl<'env> ScopedTask<'env> for SearchTask {
-    type Output = Vec<(String, String)>;
+    type Output = Vec<(f32, String, String)>;
     type JsValue = Object<'env>;
 
     fn compute(&mut self) -> Result<Self::Output> {
         Ok(self.inner.lock().unwrap().search(&self.q, self.threshold, self.top_k, &self.sql_filter))
     }
 
-    fn resolve(&mut self, env: &'env Env, output: Self::Output) -> Result<Self::JsValue> {
-        let mut rows: Vec<Array<'env>> = Vec::with_capacity(output.len());
-        for (k, v) in output {
-            // Each pair becomes an Array<string, string>
-            let pair = Array::from_vec(env, vec![k, v])?; // Strings implement ToNapiValue
-            rows.push(pair);
+    fn resolve(&mut self, env: &'env Env, out: Self::Output) -> Result<Self::JsValue> {
+        // Outer array
+        let mut outer: Array<'env> = env.create_array(out.len() as u32)?;
+        for (i, (score, a, b)) in out.into_iter().enumerate() {
+            // Triplet [number, string, string]
+            let mut triplet: Array<'env> = env.create_array(3)?;
+            triplet.set(0, score as f64)?; // numbers as f64
+            triplet.set(1, a)?;            // String -> JS string
+            triplet.set(2, b)?;
+            outer.set(i as u32, triplet)?; // set the triplet into the outer array
         }
-        // Turn Vec<Array> into a JS Array
-        let arr = Array::from_vec(env, rows)?;
-        // If you need to return Object<'env>, coerce the Array to Object
-        arr.coerce_to_object()
+        // Return Object<'env> (Array is an Object; coerce to Object)
+        outer.coerce_to_object()
     }
+
 }
 
 pub struct ScoreTask {

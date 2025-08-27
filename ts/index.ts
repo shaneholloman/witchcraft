@@ -13,7 +13,7 @@ async function doSearch(q: string): Promise<string> {
     const results = await search(q, 0.75, 10, "");
     console.log("warp results", results);
     for (const result of results) {
-      let [_head, body] = result;
+      let [_score, _head, body] = result;
       matches.push(body);
     }
     return Promise.resolve(matches.join("\n\n"));
