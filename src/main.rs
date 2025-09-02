@@ -11,11 +11,7 @@ fn main() -> Result<()> {
     let embedder = warp::Embedder::new(&device);
     let mut cache = warp::EmbeddingsCache::new(1);
 
-    if args.len() == 3 && args[1] == "scan" {
-
-        warp::scan_documents_dir(&db, &args[2]).unwrap();
-
-    } else if args.len() == 3 && args[1] == "readcsv" {
+    if args.len() == 3 && args[1] == "readcsv" {
 
         warp::read_csv(&db, &args[2]).unwrap();
 

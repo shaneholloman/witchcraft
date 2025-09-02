@@ -692,34 +692,6 @@ fn split_tensor(tensor: &Tensor) -> Vec<Tensor> {
         .collect()
 }
 
-pub fn scan_documents_dir(db: &DB, dirname: &str) -> Result<()> {
-    println!("register documents...");
-    let mut entries: Vec<_> = fs::read_dir(dirname)?
-        .filter_map(Result::ok) // Filter out errors
-        .filter(|e| e.path().is_file()) // Only files
-        .collect();
-
-    // Sort entries by file name
-    entries.sort_by_key(|e| e.file_name());
-    let bar = ProgressBar::new(entries.len() as u64);
-
-    for entry in entries {
-        let path = entry.path();
-        let filename = path.to_str().unwrap();
-        let body = fs::read_to_string(filename)?;
-
-        let mut hasher = Sha256::new();
-        hasher.update(&body);
-        let hash = format!("{:x}", hasher.finalize());
-
-        db.add_doc(&filename, &hash, &body).unwrap();
-        bar.inc(1);
-    }
-    bar.finish();
-
-    Ok(())
-}
-
 #[derive(Debug, Deserialize)]
 struct Record {
     name: String,
