@@ -2,17 +2,46 @@
 /* eslint-disable @typescript-eslint/no-var-requires */
 const fs = require("fs");
 const path = require("path");
-const { exec } = require('child_process');
+const util = require('util');
+const exec = util.promisify(require('child_process').exec);
 
-const rootPath = path.join(__dirname, "..");
+async function run(command) {
+  console.log(`running: ${command} ...`);
+  const { stdout, stderr } = await exec(command);
+  console.log(stdout);
+  console.error(stderr);
+}
 
-// Note, console logs in this file only show up with the yarn `--verbose` option
-console.log(`warp installer starting from rootPath ${rootPath}`);
+async function build(name, version, platform, arch) {
+  if (platform == 'darwin') {
+    await run(`cargo build --release --target aarch64-apple-darwin --features accelerate`);
+    await run(`cargo build --release --target x86_64-apple-darwin --features accelerate`);
+	await run(`lipo -create target/aarch64-apple-darwin/release/libwarp.dylib target/x86_64-apple-darwin/release/libwarp.dylib -output warp.node`);
+  } else if (platform == 'win32') {
+    var target = "";
+    if (arch == "x64") {
+      target = "x86_64";
+    } else if (arch == "ia32") {
+	  target = "i686";
+    } else if (arch == "arm64") {
+	  target = "aarch64";
+    } else {
+      console.error(`unsupported warp target ${platform} ${arch}`);
+      return;
+    }
+	await run(`cargo xwin build --release --target ${target}-pc-windows-msvc`);
+	await run(`target/${target}-pc-windows-msvc/release/warp.dll warp.node`);
+  }
+}
 
+const name = process.env.npm_package_name;
+const version = process.env.npm_package_version;
 const platform = process.env.npm_config_platform || process.platform;
 const arch = process.env.npm_config_arch || process.arch;
-console.log(`warp installer arch: ${arch}`);
 
-const filename = `${name}-${version}-${platform}-${arch}`;
-const fullPath = path.join(rootPath, "per-platform", filename);
-console.error("build warp into", fullPath);
+if (process.env.ENABLE_WARP == '1') {
+  console.log(`building Warp module for ${platform} ${arch}`);
+  build(name, version, platform, arch);
+} else {
+  console.log(`Not building Warp, set ENABLE_WARP=1 in environment to enable`);
+}
