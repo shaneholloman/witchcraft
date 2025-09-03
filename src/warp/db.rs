@@ -24,9 +24,11 @@ impl DB {
             .busy_timeout(std::time::Duration::from_secs(5))
             .unwrap();
 
-        let query = format!("CREATE TABLE IF NOT EXISTS document(metadata JSON, hash TEXT
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS document(metadata JSON, hash TEXT
             CHECK (length(hash) = {HASH_CHARS}),
-            body TEXT, UNIQUE(metadata, hash))");
+            body TEXT, UNIQUE(metadata, hash))"
+        );
         connection.execute(&query, ()).unwrap();
 
         let query = "CREATE INDEX IF NOT EXISTS document_index ON document(hash)";
@@ -38,10 +40,12 @@ impl DB {
         let query = "INSERT INTO document_fts(document_fts) VALUES('rebuild')";
         connection.execute(query, ()).unwrap();
 
-        let query = format!("CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY
+        let query = format!(
+            "CREATE TABLE IF NOT EXISTS chunk(hash TEXT PRIMARY KEY
             CHECK (length(hash) = {HASH_CHARS}),
             model TEXT,
-            embeddings BLOB NOT NULL)");
+            embeddings BLOB NOT NULL)"
+        );
         connection.execute(&query, ()).unwrap();
 
         let query = "CREATE INDEX IF NOT EXISTS chunk_index ON chunk(hash)";

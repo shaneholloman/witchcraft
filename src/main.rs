@@ -1,12 +1,12 @@
 use anyhow::Result;
-use std::env;
+use csv;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use csv;
 
-mod warp;
 mod histogram;
+mod warp;
 
 use warp::DB;
 

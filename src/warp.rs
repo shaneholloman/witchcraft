@@ -38,15 +38,19 @@ pub fn make_device() -> Device {
 
 #[cfg(feature = "progress")]
 pub mod progress {
-    use indicatif::{ProgressBar};
+    use indicatif::ProgressBar;
     pub struct Bar(pub ProgressBar);
     pub fn new(len: u64) -> Bar {
         let pb = ProgressBar::new(len);
         Bar(pb)
     }
     impl Bar {
-        pub fn inc(&self, n: u64) { self.0.inc(n); }
-        pub fn finish(&self) { self.0.finish(); }
+        pub fn inc(&self, n: u64) {
+            self.0.inc(n);
+        }
+        pub fn finish(&self) {
+            self.0.finish();
+        }
     }
 }
 
@@ -54,7 +58,9 @@ pub mod progress {
 pub mod progress {
     #[derive(Clone, Copy)]
     pub struct Bar;
-    pub fn new(_len: u64) -> Bar { Bar }
+    pub fn new(_len: u64) -> Bar {
+        Bar
+    }
     impl Bar {
         pub fn inc(&self, _n: u64) {}
         pub fn finish(&self) {}
