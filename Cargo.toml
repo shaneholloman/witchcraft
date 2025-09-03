@@ -3,13 +3,17 @@ name = "warp"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "warp-cli"
-path = "src/main.rs"
+#[profile.release]
+#lto = true
+#codegen-units = 1
 
-[[bin]]
-name = "quantize-tool"
-path = "src/quantize-tool.rs"
+[[bin]]                         # !Dash
+name = "warp-cli"               # !Dash
+path = "src/main.rs"            # !Dash
+
+[[bin]]                         # !Dash
+name = "quantize-tool"          # !Dash
+path = "src/quantize-tool.rs"   # !Dash
 
 [lib]
 crate-type = ["cdylib"]
