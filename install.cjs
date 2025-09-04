@@ -28,7 +28,7 @@ async function build(platform, arch) {
       console.error(`unsupported warp target ${platform} ${arch}`);
       return;
     }
-	await run(`cargo xwin build --locked --release --target ${target}-pc-windows-msvc`);
+	await run(`cargo build --locked --release --target ${target}-pc-windows-msvc`);
 	await run(`cp target/${target}-pc-windows-msvc/release/warp.dll warp.node`);
   }
 }
