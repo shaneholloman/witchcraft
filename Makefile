@@ -40,5 +40,6 @@ run: build
 	node index.js
 
 mcp: buildemb
-	yarn build
-	cmcp "yarn start" tools/call name=search 'arguments:={"q": "teenagers and acne" }'
+	yarn napi build --release --features metal
+	yarn tsc
+	cmcp "node dist/index.js" tools/call name=search 'arguments:={"q": "teenagers and acne" }'
