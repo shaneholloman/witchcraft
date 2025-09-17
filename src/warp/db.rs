@@ -119,14 +119,12 @@ impl DB {
         self.connection.prepare(&sql).unwrap()
     }
 
-    pub fn begin_transaction(&self) -> SQLResult<()> {
+    pub fn begin_transaction(&self) {
         self.connection.execute("BEGIN", ()).unwrap();
-        Ok(())
     }
 
-    pub fn commit_transaction(&self) -> SQLResult<()> {
+    pub fn commit_transaction(&self) {
         self.connection.execute("COMMIT", ()).unwrap();
-        Ok(())
     }
 
     pub fn add_doc(
@@ -161,14 +159,13 @@ impl DB {
         hash: &str,
         model: &str,
         embeddings: &Vec<u8>,
-    ) -> SQLResult<()> {
+    ) {
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO chunk VALUES(?1, ?2, ?3)",
                 (&hash, &model, embeddings),
             )
             .unwrap();
-        Ok(())
     }
 
     pub fn add_bucket(
@@ -178,23 +175,21 @@ impl DB {
         center: &Vec<u8>,
         indices: &Vec<u8>,
         residuals: &Vec<u8>,
-    ) -> SQLResult<()> {
+    ) {
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO bucket VALUES(?1, ?2, ?3, ?4, ?5)",
                 (id, generation, center, indices, residuals),
             )
             .unwrap();
-        Ok(())
     }
 
-    pub fn add_indexed_chunk(self: &Self, chunkid: u32, generation: u32) -> SQLResult<()> {
+    pub fn add_indexed_chunk(self: &Self, chunkid: u32, generation: u32) {
         self.connection
             .execute(
                 "INSERT OR REPLACE INTO indexed_chunk VALUES(?1, ?2)",
                 (chunkid, generation),
             )
             .unwrap();
-        Ok(())
     }
 }

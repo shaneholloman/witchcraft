@@ -251,7 +251,7 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     println!("writes took {} ms.", writes_total);
     println!("merge all");
 
-    db.begin_transaction().unwrap();
+    db.begin_transaction();
 
     let max_generation = db
         .query("SELECT max(generation) FROM indexed_chunk")
@@ -270,12 +270,11 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
             &center_bytes,
             &entry.tags,
             &entry.data,
-        )
-        .unwrap();
+        );
     }
     println!("write {} chunk ids to indexed_chunk", all_chunkids.len());
     for chunkid in all_chunkids {
-        db.add_indexed_chunk(chunkid, next_generation).unwrap();
+        db.add_indexed_chunk(chunkid, next_generation);
     }
 
     db.query("DELETE FROM bucket WHERE generation <= ?1")
@@ -284,7 +283,7 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     db.query("DELETE FROM indexed_chunk WHERE generation <= ?1")
         .execute((max_generation,))
         .unwrap();
-    db.commit_transaction().unwrap();
+    db.commit_transaction();
 
     Ok(())
 }
@@ -824,7 +823,7 @@ pub fn embed_chunks(db: &DB, device: &Device, limit: Option<usize>) -> Result<us
         //println!("quantization took {} ms.", now.elapsed().as_millis());
 
         //let now = std::time::Instant::now();
-        db.add_chunk(&hash, "xtr-base-en", &bytes).unwrap();
+        db.add_chunk(&hash, "xtr-base-en", &bytes);
         count += 1;
         //println!("database insert took {} ms.", now.elapsed().as_millis());
     }
