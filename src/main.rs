@@ -194,8 +194,11 @@ fn main() -> Result<()> {
         for (i, score) in scores.iter().enumerate() {
             println!("`{}': score={}", args[3 + i], *score);
         }
+    } else if args.len() == 2 && &args[1] == "clear" {
+        let mut db = DB::new(db_name).unwrap();
+        let _ = db.clear();
     } else {
-        eprintln!("\n*** Usage: {} scan | readcsv <file> | embed | index | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);
+        eprintln!("\n*** Usage: {} clear | readcsv <file> | embed | index | query <text> | hybrid <text> | querycsv <file> <results-file> ***\n", args[0]);
     };
     Ok(())
 }
