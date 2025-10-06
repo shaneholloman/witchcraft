@@ -857,7 +857,7 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
     Ok(count)
 }
 
-pub fn count_unindexed_chunks(db: &DB) -> Result<usize> {
+pub fn count_unindexed_embeddings(db: &DB) -> Result<usize> {
     let mut unindexed_chunks_query = db.query(&format!(
         "SELECT IFNULL(SUM(length(c.embeddings)), 0)/{EMBEDDING_DIM} AS total
         FROM chunk AS c
@@ -872,12 +872,12 @@ pub fn count_unindexed_chunks(db: &DB) -> Result<usize> {
 }
 
 pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
-    let unindexed = count_unindexed_chunks(&db)?;
+    let unindexed = count_unindexed_embeddings(&db)?;
     if unindexed == 0 {
         info!("all chunks indexed already!");
         return Ok(());
     }
-    info!("database has {} unindexed chunks, reindexing...", unindexed);
+    info!("database has {} unindexed embeddings, reindexing...", unindexed);
 
     let mut kmeans_query = db.query("SELECT chunk.embeddings FROM chunk")?;
     let mut total_embeddings = 0;

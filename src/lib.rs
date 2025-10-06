@@ -211,7 +211,7 @@ impl Indexer {
                                     }
                                 };
                             }
-                            if warp::count_unindexed_chunks(&db).unwrap_or(0) > 2048 {
+                            if warp::count_unindexed_embeddings(&db).unwrap_or(0) > 2048 {
                                 match warp::index_chunks(&db, &device) {
                                     Ok(()) => {}
                                     Err(v) => {
