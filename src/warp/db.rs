@@ -84,6 +84,15 @@ impl DB {
             END";
         connection.execute(query, ())?;
 
+        let query = "CREATE TRIGGER IF NOT EXISTS document_after_update
+            AFTER UPDATE ON document
+            BEGIN
+              DELETE FROM chunk
+              WHERE hash = OLD.hash
+                AND NOT EXISTS (SELECT 1 FROM document WHERE hash = OLD.hash);
+            END";
+        connection.execute(query, ())?;
+
         let query = "CREATE TABLE IF NOT EXISTS bucket(id INTEGER PRIMARY KEY,
             generation INTEGER NOT NULL,
             center BLOB NOT NULL, indices BLOB NOT NULL, residuals BLOB NOT NULL)";
@@ -176,7 +185,9 @@ impl DB {
         let date = date.unwrap_or_else(Timestamp::now_utc);
 
         self.connection.execute(
-            "REPLACE INTO document VALUES(?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO document VALUES(?1, ?2, ?3, ?4, ?5)
+            ON CONFLICT(uuid) DO UPDATE SET
+                date = ?2, metadata = ?3, hash = ?4, body = ?5",
             (&uuid.to_string(), date.to_string(), metadata, &hash, &body),
         )?;
         self.remove_on_shutdown = false;
@@ -191,7 +202,7 @@ impl DB {
 
     pub fn add_chunk(self: &Self, hash: &str, model: &str, embeddings: &Vec<u8>) -> SQLResult<()> {
         self.connection.execute(
-            "INSERT OR REPLACE INTO chunk VALUES(?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO chunk VALUES(?1, ?2, ?3)",
             (&hash, &model, embeddings),
         )?;
         Ok(())
