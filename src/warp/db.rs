@@ -195,7 +195,7 @@ impl DB {
 
     pub fn remove_doc(self: &mut Self, uuid: &Uuid) -> SQLResult<()> {
         self.connection
-            .execute("DELETE FROM document WHERE uuid = ?1)", (uuid.to_string(),))?;
+            .execute("DELETE FROM document WHERE uuid = ?1", (uuid.to_string(),))?;
         Ok(())
     }
 
