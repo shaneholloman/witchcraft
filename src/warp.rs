@@ -981,7 +981,7 @@ pub fn search(
         match match_centroids(&db, &qe, threshold, top_k, sql_filter) {
             Ok(result) => result,
             Err(v) => {
-                info!("match_centroids failed {v}");
+                warn!("match_centroids failed {v}");
                 [].to_vec()
             }
         }
@@ -1027,7 +1027,7 @@ pub fn search(
         *score = max;
     }
 
-    info!(
+    debug!(
         "warp search took {} ms end-to-end.",
         now.elapsed().as_millis()
     );
@@ -1075,10 +1075,7 @@ pub fn score_query_sentences(
         scores.push(max.mean(0)?.to_scalar::<f32>()?);
         i += sz;
     }
-    for i in 0usize..sentences.len() {
-        info!("warp sentence score {} {}", sentences[i], scores[i]);
-    }
-    info!(
+    debug!(
         "scoring {} sentences took {} ms.",
         sentences.len(),
         now.elapsed().as_millis()

@@ -27,7 +27,7 @@ pub struct LogEvent {
 }
 
 // Store the threadsafe function using a boxed type-erased version
-static TSFN: OnceCell<Box<dyn Fn(LogEvent) + Send + Sync>> = OnceCell::new();
+static LOGFN: OnceCell<Box<dyn Fn(LogEvent) + Send + Sync>> = OnceCell::new();
 
 struct JsLogger;
 
@@ -37,7 +37,7 @@ impl Log for JsLogger {
     }
 
     fn log(&self, record: &Record) {
-        if let Some(callback) = TSFN.get() {
+        if let Some(callback) = LOGFN.get() {
             let evt = LogEvent {
                 level: record.level().to_string().to_lowercase(),
                 message: record.args().to_string(),
@@ -80,7 +80,7 @@ pub fn set_log_callback(
     )?;
 
     // Wrap the threadsafe function in a closure that we can store
-    let _ = TSFN.set(Box::new(move |evt: LogEvent| {
+    let _ = LOGFN.set(Box::new(move |evt: LogEvent| {
         let _ = tsfn.call((evt,), ThreadsafeFunctionCallMode::NonBlocking);
     }));
 
@@ -95,6 +95,51 @@ pub fn set_log_callback(
     };
     let _ = log::set_logger(&LOGGER).map(|_| log::set_max_level(lvl));
     Ok(())
+}
+
+#[napi(object)]
+pub struct StatsEvent {
+    pub name: String,
+    pub number: f64,
+}
+
+// Store the threadsafe function using a boxed type-erased version
+static STATSFN: OnceCell<Box<dyn Fn(StatsEvent) + Send + Sync>> = OnceCell::new();
+
+#[napi]
+pub fn set_stats_callback(
+    callback: Function<(LogEvent,), Unknown>,
+) -> Result<()> {
+    use napi::threadsafe_function::ThreadsafeFunctionCallMode;
+
+    // Safety: We're intentionally leaking the callback reference to make it 'static
+    // This is okay because we only set the callback once and it lives for the duration of the program
+    let callback_static: Function<'static, (StatsEvent,), Unknown> =
+        unsafe { std::mem::transmute(callback) };
+
+    let tsfn = callback_static.build_threadsafe_function().build_callback(
+        |ctx: ThreadsafeCallContext<(StatsEvent,)>| {
+            // Extract the first element from the tuple (StatsEvent,) to pass just the StatsEvent
+            Ok(ctx.value.0)
+        },
+    )?;
+
+    // Wrap the threadsafe function in a closure that we can store
+    let _ = STATSFN.set(Box::new(move |evt: StatsEvent| {
+        let _ = tsfn.call((evt,), ThreadsafeFunctionCallMode::NonBlocking);
+    }));
+
+    Ok(())
+}
+
+pub fn stats(name: &str, number: f64) {
+    if let Some(callback) = STATSFN.get() {
+        let evt = StatsEvent {
+            name: name.to_string(),
+            number: number,
+        };
+        callback(evt);
+    }
 }
 
 enum Job {
@@ -198,12 +243,16 @@ impl Indexer {
                             loop {
                                 match &embedder {
                                     Some(embedder) => {
+                                        let now = std::time::Instant::now();
                                         let got = match warp::embed_chunks(&db, &embedder, Some(10)) {
                                             Ok(got) => got,
                                             Err(_v) => {
                                                 break;
                                             }
                                         };
+                                        let dt = now.elapsed().as_secs_f64();
+                                        stats("embed-docs-per-second", ((got as f64) / dt).round());
+
                                         if got == 0 || drain_commands() {
                                             break;
                                         }
@@ -214,12 +263,14 @@ impl Indexer {
                                 };
                             }
                             if warp::count_unindexed_embeddings(&db).unwrap_or(0) > 2048 {
+                                let now = std::time::Instant::now();
                                 match warp::index_chunks(&db, &device) {
                                     Ok(()) => {}
                                     Err(v) => {
                                         warn!("index_chunks failed! {}", v);
                                     }
                                 }
+                                stats("indexing-time-ms", now.elapsed().as_millis() as f64);
                             }
                         }
                         _ => {}
@@ -329,7 +380,8 @@ impl WarpInner {
                     Vec::new()
                 },
                 |(embedder, db)| {
-                    warp::search(
+                    let now = std::time::Instant::now();
+                    let results = warp::search(
                         db,
                         embedder,
                         &mut self.cache,
@@ -342,7 +394,9 @@ impl WarpInner {
                     .unwrap_or_else(|e| {
                         warn!("error {e} querying");
                         Vec::new()
-                    })
+                    });
+                    stats("search-latency-ms", now.elapsed().as_millis() as f64);
+                    results
                 },
             )
     }
