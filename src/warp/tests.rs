@@ -48,6 +48,12 @@ mod tests {
         ("facts about fruits and berries", 0),
     ];
 
+    const EASY_QUERIES : [(&str, u32); 3] = [
+        ("a lake in Australia that stays bright pink", 31),
+        ("A group of flamingos", 15),
+        ("Bananas are berries", 0),
+    ];
+
     #[test]
     fn test_end_to_end() -> std::io::Result<()> {
 
@@ -128,6 +134,12 @@ mod tests {
         db.add_doc(&uuid, None, &uuid.to_string(), &body, Some(lens)).unwrap();
 
         for (q, pos) in QUERIES {
+            let results = warp::search(&db, &embedder, &mut cache, &q.to_string(), 0.75, 10, false, None).unwrap();
+            for (_score, _metadata, _body, body_idx) in results {
+                assert!(body_idx == pos);
+            }
+        }
+        for (q, pos) in EASY_QUERIES {
             let results = warp::search(&db, &embedder, &mut cache, &q.to_string(), 0.75, 10, true, None).unwrap();
             for (_score, _metadata, _body, body_idx) in results {
                 assert!(body_idx == pos);

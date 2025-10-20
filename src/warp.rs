@@ -374,7 +374,7 @@ pub fn fulltext_search(
     q: &String,
     top_k: usize,
     sql_filter: Option<&str>,
-) -> Result<Vec<(f32, u32, String)>> {
+) -> Result<Vec<(f32, u32, u32)>> {
     let mut fts_matches = vec![];
 
     let mut last_is_space = false;
@@ -393,7 +393,7 @@ pub fn fulltext_search(
 
     let sql = if q.len() > 0 {
         format!(
-            "SELECT document.rowid, snippet(document_fts,-1, '<em>','</em>','...',15),
+            "SELECT document.rowid, document.body, document.lens,
             bm25(document_fts) AS score
             FROM document,document_fts
             WHERE document.rowid = document_fts.rowid
@@ -403,7 +403,7 @@ pub fn fulltext_search(
         )
     } else {
         format!(
-            "SELECT rowid,\"\",0.0
+            "SELECT rowid,\"\",\"\",0.0
             FROM document
             WHERE ?1 = ?1 {filter}
             ORDER BY date DESC
@@ -422,13 +422,32 @@ pub fn fulltext_search(
         Ok((
             row.get::<_, u32>(0)?,
             row.get::<_, String>(1)?,
-            row.get::<_, f32>(2)?
+            row.get::<_, String>(2)?,
+            row.get::<_, f32>(3)?
         ))
     })?;
     for result in results {
-        let (rowid, snippet, score) = result?;
+        let (rowid, body, lens, score) = result?;
         let score2 = bm25_to_cosine_approx(score);
-        fts_matches.push((score2, rowid, snippet));
+
+        let lens: Vec<usize> = lens
+            .split(',')
+            .filter_map(|s| s.parse::<usize>().ok())
+            .collect();
+
+        let mut max = -1.0f64;
+        let mut i_max = 0;
+        if lens.len() > 0 {
+            let bodies = split_by_codepoints(&body, &lens);
+            for (i, &b) in bodies.iter().enumerate() {
+                let score = strsim::jaro_winkler(&q, &b);
+                if score > max {
+                    max = score;
+                    i_max = i;
+                }
+            }
+        }
+        fts_matches.push((score2, rowid, i_max as u32));
     }
     info!("full text found {} matches", fts_matches.len());
     Ok(fts_matches)
@@ -1121,11 +1140,6 @@ pub fn search(
         [].to_vec()
     };
 
-    let mut fts_snippets: HashMap<u32, String> = HashMap::new();
-    for (_score, idx, snippet) in &fts_matches {
-        fts_snippets.insert(*idx, snippet.clone());
-    }
-
     let sem_matches = if q.len() > 3 {
         let qe = match cache.get(&q) {
             Some(existing) => existing,
@@ -1149,11 +1163,15 @@ pub fn search(
 
     let mut scores: HashMap<u32, f32> = HashMap::new();
     let mut offsets: HashMap<u32, u32> = HashMap::new();
+
+    for (_score, idx, body_idx) in &fts_matches {
+        offsets.insert(*idx, *body_idx);
+    }
     for (score, idx, offset) in &sem_matches {
         scores.insert(*idx, *score);
         offsets.insert(*idx, *offset);
     }
-    for (score, idx, _snippet) in &fts_matches {
+    for (score, idx, _body_idx) in &fts_matches {
         scores.insert(*idx, *score);
     }
 
@@ -1252,16 +1270,16 @@ pub fn score_query_sentences(
     Ok(scores)
 }
 
-/*
-pub fn split_by_codepoints<'a>(s: &'a str, lengths: &[usize]) -> Result<Vec<&'a str>, String> {
+pub fn split_by_codepoints<'a>(s: &'a str, lengths: &[usize]) -> Vec<&'a str> {
     // Precompute byte indices of every char boundary: [0, b1, b2, ..., s.len()]
     let mut boundaries: Vec<usize> = s.char_indices().map(|(i, _)| i).collect();
     boundaries.push(s.len());
-    let char_len = boundaries.len() - 1;
 
+    let char_len = boundaries.len() - 1;
     let sum_chars: usize = lengths.iter().copied().sum();
     if sum_chars != char_len {
-        return Err(format!("lengths sum ({}) != char count ({})", sum_chars, char_len));
+        warn!("sum of lengths does not match utf8-length of string!");
+        return [].to_vec();
     }
 
     let mut parts = Vec::with_capacity(lengths.len());
@@ -1275,10 +1293,9 @@ pub fn split_by_codepoints<'a>(s: &'a str, lengths: &[usize]) -> Result<Vec<&'a 
         parts.push(&s[start_byte..end_byte]);
         pos = end_pos;
     }
-
-    Ok(parts)
+    parts
 }
-*/
+
 #[test]
 fn test_compress_decompress_keys_roundtrip() {
     let test_cases = vec![
