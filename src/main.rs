@@ -109,7 +109,7 @@ pub fn bulk_search(
         let fts_matches = if use_fulltext {
             warp::fulltext_search(&db, &question, top_k, None)?
         } else {
-            [].to_vec()
+            vec![]
         };
 
         let sem_matches = if use_semantic {
@@ -122,7 +122,7 @@ pub fn bulk_search(
             debug!("embedder took {} ms.", now.elapsed().as_millis());
             warp::match_centroids(&db, &qe, 0.0, top_k, None).unwrap()
         } else {
-            [].to_vec()
+            vec![]
         };
         let sem_idxs: Vec<u32> = sem_matches.iter().map(|&(_, idx, _)| idx).collect();
         let mut fused = if use_fulltext {

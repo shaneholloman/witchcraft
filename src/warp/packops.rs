@@ -1,6 +1,20 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor};
 
+pub fn make_q4_dequant_table() -> Result<[f32; 16]> {
+    // Create 0..16 tensor
+    let x = Tensor::arange(0f32, 16f32, &Device::Cpu)?;
+    let x = x.dequantize(4)?.inv_compand()?;
+
+    // Extract into a fixed array
+    let mut table = [0f32; 16];
+    for i in 0..16 {
+        table[i] = x.get(i)?.to_scalar::<f32>()?;
+    }
+
+    Ok(table)
+}
+
 pub trait TensorPackOps {
     fn compand(&self) -> Result<Tensor>;
     fn inv_compand(&self) -> Result<Tensor>;
@@ -10,7 +24,7 @@ pub trait TensorPackOps {
     fn stretch_rows(&self) -> Result<Tensor>;
     //fn from_q4_bytes(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
     fn from_q8_bytes(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
-    fn from_companded_q4_bytes(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
+    fn from_companded_q4_bytes(bytes: &[u8], cols: usize, table: &[f32; 16], device: &Device) -> Result<Tensor>;
     //fn from_companded_q8_bytes(buffer: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
     fn from_f32_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor>;
     fn to_q4_bytes(&self) -> Result<Vec<u8>>;
@@ -170,14 +184,7 @@ impl TensorPackOps for Tensor {
         Ok(bytes)
     }
 
-    fn from_companded_q4_bytes(bytes: &[u8], cols: usize, device: &Device) -> Result<Tensor> {
-        let x = Tensor::arange(0.0f32, 16.0f32, &Device::Cpu)?;
-        let x = x.dequantize(4)?.inv_compand()?;
-        let mut table: [f32; 16] = [0.0; 16];
-        for i in 0..16 {
-            table[i] = x.get(i)?.to_scalar()?;
-        }
-
+    fn from_companded_q4_bytes(bytes: &[u8], cols: usize, table: &[f32; 16], device: &Device) -> Result<Tensor> {
         let mut out = Vec::with_capacity(bytes.len() * 2);
         for &byte in bytes {
             let high = (byte >> 4) & 0x0f;

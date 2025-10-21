@@ -605,10 +605,11 @@ pub fn match_centroids(
         let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
         let (m, n) = sorted_indices.dims2()?;
 
-        let mut topk_clusters = vec![];
+        let mut topk_clusters = Vec::with_capacity(k);
         for i in 0..m {
             let row = sorted_indices.get(i)?;
             let row_scores_sorted = query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
+            let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
             let mut cumsum = 0;
             let mut score = 0.0f32;
             for j in 0..n {
@@ -618,7 +619,7 @@ pub fn match_centroids(
                 }
                 let size = sizes[idx as usize];
                 if cumsum < t_prime {
-                    score = row_scores_sorted.get(j)?.to_scalar::<f32>()?;
+                    score = row_scores_sorted[j];
                 }
                 cumsum += size;
 
@@ -638,6 +639,7 @@ pub fn match_centroids(
         );
 
         let now = std::time::Instant::now();
+        let table: [f32; 16] = packops::make_q4_dequant_table()?;
 
         for i in topk_clusters {
             let (keys_compressed, document_embeddings) = bucket_query
@@ -653,6 +655,7 @@ pub fn match_centroids(
                     let residuals = Tensor::from_companded_q4_bytes(
                         &document_embeddings,
                         EMBEDDING_DIM,
+                        &table,
                         &Device::Cpu,
                     )?;
                     let embeddings = residuals.broadcast_add(&center)?;
@@ -729,7 +732,7 @@ pub fn match_centroids(
     );
 
     if all_document_embeddings.len() == 0 {
-        return Ok([].to_vec());
+        return Ok(vec![]);
     }
 
     let all_document_embeddings = Tensor::cat(&all_document_embeddings, 0)?;
@@ -1140,7 +1143,7 @@ pub fn search(
     let fts_matches = if use_fulltext {
         fulltext_search(&db, &q, top_k, sql_filter)?
     } else {
-        [].to_vec()
+        vec![]
     };
 
     let sem_matches = if q.len() > 3 {
@@ -1157,11 +1160,11 @@ pub fn search(
             Ok(result) => result,
             Err(v) => {
                 warn!("match_centroids failed {v}");
-                [].to_vec()
+                vec![]
             }
         }
     } else {
-        [].to_vec()
+        vec![]
     };
 
     let mut scores: HashMap<u32, f32> = HashMap::new();
@@ -1280,7 +1283,7 @@ pub fn split_by_codepoints<'a>(s: &'a str, lengths: &[usize]) -> Vec<&'a str> {
     let sum_chars: usize = lengths.iter().copied().sum();
     if sum_chars != char_len {
         warn!("sum of lengths does not match utf8-length of string!");
-        return [].to_vec();
+        return vec![];
     }
 
     let mut parts = Vec::with_capacity(lengths.len());
