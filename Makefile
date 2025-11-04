@@ -47,3 +47,8 @@ mcp: buildemb
 test: download
 	RUST_LOG=debug cargo llvm-cov nextest --release --features metal,accelerate --lcov --output-path lcov.info # --no-capture
 	genhtml lcov.info
+
+nfcorpus: build
+	cargo run --release --features accelerate --bin warp-cli readcsv datasets/nfcorpus.tsv
+	cargo run --release --features accelerate --bin warp-cli embed
+	cargo run --release --features accelerate --bin warp-cli index
