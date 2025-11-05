@@ -365,12 +365,6 @@ fn write_buckets(db: &DB, centers: &Tensor, device: &Device) -> Result<()> {
     }
 }
 
-/*
-fn bm25_to_cosine_approx(bm25: f32) -> f32 {
-    1.0 - (1.0 / (1.0 + (-bm25 / 2.0).exp())) // logistic-shaped
-}
-*/
-
 pub fn fulltext_search(
     db: &DB,
     q: &String,
@@ -430,7 +424,6 @@ pub fn fulltext_search(
     })?;
     for result in results {
         let (rowid, body, lens, _score) = result?;
-        //let score2 = 0.0f32;//bm25_to_cosine_approx(score);
         let score2 = strsim::jaro_winkler(&q, &body) as f32;
 
         let lens: Vec<usize> = lens
