@@ -1,6 +1,5 @@
 use anyhow::Result;
 use candle_core::{Device, Tensor};
-use std::collections::HashMap;
 use log::warn;
 
 use super::rans64;
@@ -28,26 +27,17 @@ pub fn make_q4_dequant_table() -> Result<[f32; 16]> {
 
 /// Normalize a histogram so that it sums to 2^log2_scale (<= 2^16),
 /// suitable for rANS.
+///
+/// Takes symbols as a slice of (symbol, count) pairs and returns
+/// a Vec of (symbol, scaled_count) pairs.
 
-pub fn scale_histogram(hist: &HashMap<u16, u32>, log2_scale: u32) -> HashMap<u16, u16> {
-    assert!(!hist.is_empty(), "Histogram must not be empty");
+pub fn scale_histogram(symbols: &[(u16, u32)], log2_scale: u32) -> Vec<(u16, u16)> {
+    assert!(!symbols.is_empty(), "Histogram must not be empty");
     assert!(log2_scale <= 16, "log2_scale must be <= 16");
 
     let target_total: u32 = 1 << log2_scale;
-
-    // Collect only symbols with non-zero counts.
-    let symbols: Vec<(u16, u32)> = hist
-        .iter()
-        .filter(|(_, count)| **count > 0)
-        .map(|(&s, &c)| (s, c))
-        .collect();
-
-    assert!(
-        !symbols.is_empty(),
-        "Histogram must contain at least one non-zero symbol"
-    );
-
     let m = symbols.len() as u32;
+
     assert!(
         m <= target_total,
         "Not enough room to assign at least 1 frequency to every symbol"
@@ -59,55 +49,51 @@ pub fn scale_histogram(hist: &HashMap<u16, u32>, log2_scale: u32) -> HashMap<u16
     // Sum of input counts.
     let sum: u64 = symbols.iter().map(|&(_, c)| c as u64).sum();
 
-    let mut scaled: HashMap<u16, u32> = HashMap::with_capacity(symbols.len());
-    let mut remainders: Vec<(u64, u16)> = Vec::with_capacity(symbols.len());
+    // Use Vec of (symbol, scaled_freq) instead of HashMap
+    let mut scaled: Vec<(u16, u32)> = Vec::with_capacity(symbols.len());
+    let mut remainders: Vec<(u64, usize)> = Vec::with_capacity(symbols.len());
 
-    // First assign 1 to everyone to guarantee no zeros.
-    for &(sym, _) in &symbols {
-        scaled.insert(sym, 1);
-    }
-
-    // Floor-scaling the "extra" part.
+    // Initialize with 1 for each symbol and compute quotients/remainders
     let mut acc: u32 = 0;
 
-    for &(sym, count) in &symbols {
+    for (idx, &(sym, count)) in symbols.iter().enumerate() {
         let num = (count as u64) * (remaining_total as u64);
         let q = (num / sum) as u32;
         let r = num % sum;
 
-        *scaled.get_mut(&sym).unwrap() += q;
+        scaled.push((sym, 1 + q));
         acc += q;
-
-        remainders.push((r, sym));
+        remainders.push((r, idx));
     }
 
     // Distribute any leftover slots based on largest remainders.
     let deficit = remaining_total - acc;
     if deficit > 0 {
         remainders.sort_by(|a, b| b.0.cmp(&a.0));
-        for &(_, sym) in remainders.iter().take(deficit as usize) {
-            *scaled.get_mut(&sym).unwrap() += 1;
+        for &(_, idx) in remainders.iter().take(deficit as usize) {
+            scaled[idx].1 += 1;
         }
     }
 
     // Final fixup: guarantee exact total == target_total.
-    let mut total: i64 = scaled.values().map(|&v| v as i64).sum();
+    let mut total: i64 = scaled.iter().map(|(_, v)| *v as i64).sum();
     let target = target_total as i64;
 
     if total != target {
         // Pick symbol with highest value for fixup to minimize distortion.
-        let max_sym = scaled
+        let max_idx = scaled
             .iter()
-            .max_by_key(|(_, v)| *v)
-            .map(|(&s, _)| s)
+            .enumerate()
+            .max_by_key(|(_, (_, v))| *v)
+            .map(|(i, _)| i)
             .unwrap();
 
         while total < target {
-            *scaled.get_mut(&max_sym).unwrap() += 1;
+            scaled[max_idx].1 += 1;
             total += 1;
         }
-        while total > target && scaled[&max_sym] > 1 {
-            *scaled.get_mut(&max_sym).unwrap() -= 1;
+        while total > target && scaled[max_idx].1 > 1 {
+            scaled[max_idx].1 -= 1;
             total -= 1;
         }
     }
@@ -220,7 +206,7 @@ impl TensorPackOps for Tensor {
         let (rows, cols) = self.dims2()?;
         assert!(cols <= 255, "column count must fit in u8");
 
-        let mut bytes = vec![];
+        let mut bytes = Vec::with_capacity(rows * cols);
         bytes.extend_from_slice(&(rows as u16).to_ne_bytes());
 
         for (offset, win_rows) in (0..rows)
@@ -254,35 +240,44 @@ impl TensorPackOps for Tensor {
                 *i *= inv_max_val;
             }
 
-            let qs: Vec<_> = raw
-                .iter()
-                .map(|&x| {
-                    let q = (RANGE * x).round();
-                    let s = (2.0 * q.abs() + if q < 0.0 { 1.0 } else { 0.0 }) as usize;
-                    if s > 0 {
-                        s - 1
-                    } else {
-                        0
-                    }
-                })
-                .collect();
+            // Quantize values - pre-allocate capacity
+            let mut qs: Vec<u16> = Vec::with_capacity(raw.len());
+            let mut max_symbol = 0u16;
 
-            let mut hist: HashMap<u16, u32> = HashMap::new();
-            for &q in &qs {
-                *hist.entry(q as u16).or_insert(0) += 1;
+            for &x in &raw {
+                let q = (RANGE * x).round();
+                let s = (2.0 * q.abs() + if q < 0.0 { 1.0 } else { 0.0 }) as usize;
+                let symbol = if s > 0 { s - 1 } else { 0 } as u16;
+                qs.push(symbol);
+                max_symbol = max_symbol.max(symbol);
             }
 
-            let hist = scale_histogram(&hist, RANS_BITS);
-            let mut hist: Vec<_> = hist.iter().collect();
+            // Build histogram using array (now that we know max_symbol)
+            let mut hist_array: Vec<u32> = vec![0; (max_symbol + 1) as usize];
+            for &symbol in &qs {
+                hist_array[symbol as usize] += 1;
+            }
+
+            // Convert array histogram to Vec for scale_histogram
+            let mut symbols: Vec<(u16, u32)> = Vec::new();
+            for (symbol, &count) in hist_array.iter().enumerate() {
+                if count > 0 {
+                    symbols.push((symbol as u16, count));
+                }
+            }
+
+            let mut hist = scale_histogram(&symbols, RANS_BITS);
             hist.sort_by_key(|(k, _v)| *k);
 
             bytes.extend_from_slice(&(hist.len() as u16).to_ne_bytes());
+
+            // Use Vec instead of HashMap for faster lookup during encoding
+            let mut q2sym: Vec<Option<rans64::RansEncSymbol>> = vec![None; (max_symbol + 1) as usize];
             let mut cum = 0u32;
-            let mut q2sym: HashMap<u16, rans64::RansEncSymbol> = HashMap::new();
-            for &(&q, &freq) in hist.iter() {
-                //println!("q={q} freq={freq}");
+
+            for &(q, freq) in &hist {
                 let freq_u32 = freq as u32;
-                q2sym.insert(q, rans64::RansEncSymbol::new(cum, freq_u32, RANS_BITS));
+                q2sym[q as usize] = Some(rans64::RansEncSymbol::new(cum, freq_u32, RANS_BITS));
                 bytes.extend_from_slice(&(q as u16).to_ne_bytes());
                 bytes.extend_from_slice(&(freq as u16).to_ne_bytes());
                 cum += freq_u32;
@@ -290,7 +285,8 @@ impl TensorPackOps for Tensor {
 
             let mut encoder = rans64::RansEncoder::new(2 * win_rows * cols);
             for &q in &qs {
-                encoder.put(&q2sym.get(&(q as u16)).unwrap());
+                // Direct array access instead of HashMap lookup
+                encoder.put(q2sym[q as usize].as_ref().unwrap());
             }
             encoder.flush();
             let data = encoder.data().to_owned();
@@ -323,28 +319,33 @@ impl TensorPackOps for Tensor {
                 .map(|chunk| u16::from_ne_bytes([chunk[0], chunk[1]]))
                 .collect();
 
+            // Find max symbol to size the lookup array
+            let mut max_symbol = 0u16;
+            for i in 0..symbols_count {
+                let symbol = pairs[2 * i as usize];
+                max_symbol = max_symbol.max(symbol);
+            }
+
             let mut cum = 0;
             let mut cum2q: [u16; 1 << RANS_BITS] = [0; 1 << RANS_BITS];
-            let mut q2sym: HashMap<u16, rans64::RansDecSymbol> = HashMap::new();
+
+            // Use a sentinel value for unused symbols (0 freq, 0 start is safe but never used)
+            let default_sym = rans64::RansDecSymbol::new(0, 1)?;
+            let mut q2sym: Vec<rans64::RansDecSymbol> = vec![default_sym; (max_symbol + 1) as usize];
+
             for i in 0..symbols_count {
                 let symbol = pairs[2 * i as usize];
                 let freq = pairs[2 * i as usize + 1] as u32;
                 for c in cum..cum + freq {
                     cum2q[c as usize] = symbol;
                 }
-                q2sym.insert(symbol, rans64::RansDecSymbol::new(cum.into(), freq.into())?);
+                q2sym[symbol as usize] = rans64::RansDecSymbol::new(cum.into(), freq.into())?;
                 cum += freq;
             }
 
-            let (head, tail) = tail.split_at(2);
-            let compressed_size = u16::from_ne_bytes(head.try_into().unwrap()) as usize;
-
-            let (head, tail) = tail.split_at(compressed_size);
-            let mut decoder = rans64::RansDecoder::new(head.to_owned())?;
-            let mut t = vec![];
-            for i in 0..(win_rows * cols) {
-                let cum = decoder.get(RANS_BITS);
-                let q = cum2q[cum as usize];
+            // Pre-compute symbol -> float lookup table to eliminate branches in hot loop
+            let mut q2float: Vec<f32> = Vec::with_capacity((max_symbol + 1) as usize);
+            for q in 0..=max_symbol {
                 let x = if q == 0 {
                     0.0
                 } else {
@@ -353,15 +354,27 @@ impl TensorPackOps for Tensor {
                     let magnitude = (q >> 1) as f32;
                     scale * sign * magnitude
                 };
+                q2float.push(x);
+            }
+
+            let (head, tail) = tail.split_at(2);
+            let compressed_size = u16::from_ne_bytes(head.try_into().unwrap()) as usize;
+
+            let (head, tail) = tail.split_at(compressed_size);
+            let mut decoder = rans64::RansDecoder::new(head.to_owned())?;
+
+            let mut t = Vec::with_capacity(win_rows * cols);
+
+            for _i in 0..(win_rows * cols) {
+                let cum = decoder.get(RANS_BITS);
+                let q = cum2q[cum as usize];
+                let x = q2float[q as usize];
                 t.push(x);
-                match decoder.advance(q2sym.get(&q).unwrap(), RANS_BITS) {
-                    Ok(()) => {
-                    }
-                    Err(v) => {
-                        warn!("RANS decoding failed at i={i}");
-                        return Err(v.into());
-                    }
-                };
+
+                if let Err(e) = decoder.advance(&q2sym[q as usize], RANS_BITS) {
+                    warn!("RANS decoding failed");
+                    return Err(e.into());
+                }
             }
             t.reverse();
 
