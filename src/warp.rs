@@ -28,7 +28,7 @@ pub mod rans64;
 mod merger;
 
 pub mod types;
-pub use types::SqlStatement;
+pub use types::SqlStatementInternal;
 
 mod sql_generator;
 use sql_generator::build_filter_sql_and_params;
@@ -410,7 +410,7 @@ pub fn fulltext_search(
     db: &DB,
     q: &String,
     top_k: usize,
-    sql_filter: Option<&SqlStatement>,
+    sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<Vec<(f32, u32, u32)>> {
     let mut fts_matches = vec![];
 
@@ -621,7 +621,7 @@ pub fn match_centroids(
     query_embeddings: &Tensor,
     threshold: f32,
     top_k: usize,
-    sql_filter: Option<&SqlStatement>,
+    sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<Vec<(f32, u32, u32)>> {
     let max_generation = db
         .query("SELECT MAX(generation) FROM indexed_chunk")?
@@ -1250,7 +1250,7 @@ pub fn search(
     threshold: f32,
     top_k: usize,
     use_fulltext: bool,
-    sql_filter: Option<&SqlStatement>,
+    sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<Vec<(f32, String, String, u32)>> {
     let now = std::time::Instant::now();
 

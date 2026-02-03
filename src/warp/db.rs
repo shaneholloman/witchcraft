@@ -1,9 +1,12 @@
+use super::types::SqlStatementInternal;
 use iso8601_timestamp::Timestamp;
 use log::{error, warn};
-use rusqlite::{Connection, OpenFlags, Result as SQLResult, Statement};
+use rusqlite::{Connection, OpenFlags, Result as SQLResult, Statement, params_from_iter};
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use uuid::Uuid;
+
+use super::sql_generator::build_filter_sql_and_params;
 
 const HASH_CHARS: usize = 32; // we'll use sha256 truncated at 128 bits/32 characters
 
@@ -141,8 +144,7 @@ impl DB {
         let query = "CREATE TABLE IF NOT EXISTS indexed_chunk(chunkid INTEGER PRIMARY KEY NOT NULL, generation INTEGER NOT NULL)";
         connection.execute(query, ())?;
 
-        let query =
-            "CREATE UNIQUE INDEX IF NOT EXISTS indexed_chunk_index ON indexed_chunk(chunkid, generation)";
+        let query = "CREATE UNIQUE INDEX IF NOT EXISTS indexed_chunk_index ON indexed_chunk(chunkid, generation)";
         connection.execute(query, ())?;
         Ok(Self {
             db_fn: db_fn,
@@ -168,6 +170,24 @@ impl DB {
     pub fn clear(&mut self) {
         self.remove_on_shutdown = true;
         let _ = self.clear_inner();
+    }
+
+    pub fn delete_with_filter(&mut self, sql_filter: &SqlStatementInternal) -> SQLResult<()> {
+        let (filter_sql, params) = build_filter_sql_and_params(Some(sql_filter))
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(err.into()))?;
+
+        if filter_sql.trim().is_empty() {
+            return self.clear_inner();
+        }
+
+        let delete_sql = format!("DELETE FROM document WHERE {filter_sql}");
+        let mut statement = self.connection.prepare(&delete_sql)?;
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params
+            .iter()
+            .map(|param| param.as_ref() as &dyn rusqlite::ToSql)
+            .collect();
+        statement.execute(params_from_iter(param_refs))?;
+        Ok(())
     }
 
     pub fn shutdown(&mut self) {

@@ -1,4 +1,4 @@
-use super::types::{SqlLogic, SqlOperator, SqlStatement, SqlStatementType, SqlValue};
+use super::types::{SqlLogic, SqlOperator, SqlStatementInternal, SqlStatementType, SqlValue};
 use anyhow::Result;
 
 /// Converts a SqlOperator enum to its SQL string representation
@@ -18,7 +18,7 @@ pub fn sql_operator_to_string(op: &SqlOperator) -> &'static str {
 
 /// Builds a SQL WHERE clause string and parameters from a SqlStatement structure
 pub fn build_sql_from_statement(
-    statement: &SqlStatement,
+    statement: &SqlStatementInternal,
     params: &mut Vec<Box<dyn rusqlite::ToSql>>,
 ) -> Result<String> {
     match statement.statement_type {
@@ -89,7 +89,7 @@ pub fn build_sql_from_statement(
 
 /// Builds a complete SQL filter clause and parameters from an optional SqlStatement
 pub fn build_filter_sql_and_params(
-    sql_filter: Option<&SqlStatement>,
+    sql_filter: Option<&SqlStatementInternal>,
 ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
     let mut params = Vec::new();
 
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_build_sql_from_statement_empty() {
-        let statement = SqlStatement {
+        let statement = SqlStatementInternal {
             statement_type: SqlStatementType::Empty,
             condition: None,
             logic: None,
@@ -140,10 +140,10 @@ mod tests {
 
     #[test]
     fn test_build_sql_from_statement_simple_condition() {
-        use super::super::types::SqlCondition;
-        let statement = SqlStatement {
+        use super::super::types::SqlConditionInternal;
+        let statement = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
-            condition: Some(SqlCondition {
+            condition: Some(SqlConditionInternal {
                 key: "$.field".to_string(),
                 operator: SqlOperator::Equals,
                 value: Some(SqlValue::String("value".to_string())),
@@ -161,10 +161,10 @@ mod tests {
 
     #[test]
     fn test_build_sql_from_statement_exists_condition() {
-        use super::super::types::SqlCondition;
-        let statement = SqlStatement {
+        use super::super::types::SqlConditionInternal;
+        let statement = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
-            condition: Some(SqlCondition {
+            condition: Some(SqlConditionInternal {
                 key: "$.field".to_string(),
                 operator: SqlOperator::Exists,
                 value: None,
@@ -182,10 +182,10 @@ mod tests {
 
     #[test]
     fn test_build_sql_from_statement_numeric_value() {
-        use super::super::types::SqlCondition;
-        let statement = SqlStatement {
+        use super::super::types::SqlConditionInternal;
+        let statement = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
-            condition: Some(SqlCondition {
+            condition: Some(SqlConditionInternal {
                 key: "$.count".to_string(),
                 operator: SqlOperator::GreaterThan,
                 value: Some(SqlValue::Number(42.0)),
@@ -203,10 +203,10 @@ mod tests {
 
     #[test]
     fn test_build_sql_from_statement_and_group() {
-        use super::super::types::SqlCondition;
-        let cond1 = SqlStatement {
+        use super::super::types::SqlConditionInternal;
+        let cond1 = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
-            condition: Some(SqlCondition {
+            condition: Some(SqlConditionInternal {
                 key: "$.field1".to_string(),
                 operator: SqlOperator::Equals,
                 value: Some(SqlValue::String("value1".to_string())),
@@ -215,9 +215,9 @@ mod tests {
             statements: None,
         };
 
-        let cond2 = SqlStatement {
+        let cond2 = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
-            condition: Some(SqlCondition {
+            condition: Some(SqlConditionInternal {
                 key: "$.field2".to_string(),
                 operator: SqlOperator::Equals,
                 value: Some(SqlValue::String("value2".to_string())),
@@ -226,7 +226,7 @@ mod tests {
             statements: None,
         };
 
-        let group = SqlStatement {
+        let group = SqlStatementInternal {
             statement_type: SqlStatementType::Group,
             condition: None,
             logic: Some(SqlLogic::And),
@@ -245,10 +245,10 @@ mod tests {
 
     #[test]
     fn test_build_sql_from_statement_or_group() {
-        use super::super::types::SqlCondition;
-        let cond1 = SqlStatement {
+        use super::super::types::SqlConditionInternal;
+        let cond1 = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
-            condition: Some(SqlCondition {
+            condition: Some(SqlConditionInternal {
                 key: "$.field1".to_string(),
                 operator: SqlOperator::Equals,
                 value: Some(SqlValue::String("value1".to_string())),
@@ -257,9 +257,9 @@ mod tests {
             statements: None,
         };
 
-        let cond2 = SqlStatement {
+        let cond2 = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
-            condition: Some(SqlCondition {
+            condition: Some(SqlConditionInternal {
                 key: "$.field2".to_string(),
                 operator: SqlOperator::Equals,
                 value: Some(SqlValue::String("value2".to_string())),
@@ -268,7 +268,7 @@ mod tests {
             statements: None,
         };
 
-        let group = SqlStatement {
+        let group = SqlStatementInternal {
             statement_type: SqlStatementType::Group,
             condition: None,
             logic: Some(SqlLogic::Or),
@@ -287,16 +287,16 @@ mod tests {
 
     #[test]
     fn test_build_sql_from_statement_nested_groups() {
-        use super::super::types::SqlCondition;
+        use super::super::types::SqlConditionInternal;
         // Build: (field1 = "value1" OR field2 = "value2") AND field3 > 100
-        let or_group = SqlStatement {
+        let or_group = SqlStatementInternal {
             statement_type: SqlStatementType::Group,
             condition: None,
             logic: Some(SqlLogic::Or),
             statements: Some(vec![
-                SqlStatement {
+                SqlStatementInternal {
                     statement_type: SqlStatementType::Condition,
-                    condition: Some(SqlCondition {
+                    condition: Some(SqlConditionInternal {
                         key: "$.field1".to_string(),
                         operator: SqlOperator::Equals,
                         value: Some(SqlValue::String("value1".to_string())),
@@ -304,9 +304,9 @@ mod tests {
                     logic: None,
                     statements: None,
                 },
-                SqlStatement {
+                SqlStatementInternal {
                     statement_type: SqlStatementType::Condition,
-                    condition: Some(SqlCondition {
+                    condition: Some(SqlConditionInternal {
                         key: "$.field2".to_string(),
                         operator: SqlOperator::Equals,
                         value: Some(SqlValue::String("value2".to_string())),
@@ -317,9 +317,9 @@ mod tests {
             ]),
         };
 
-        let cond3 = SqlStatement {
+        let cond3 = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
-            condition: Some(SqlCondition {
+            condition: Some(SqlConditionInternal {
                 key: "$.field3".to_string(),
                 operator: SqlOperator::GreaterThan,
                 value: Some(SqlValue::Number(100.0)),
@@ -328,7 +328,7 @@ mod tests {
             statements: None,
         };
 
-        let and_group = SqlStatement {
+        let and_group = SqlStatementInternal {
             statement_type: SqlStatementType::Group,
             condition: None,
             logic: Some(SqlLogic::And),
@@ -355,10 +355,10 @@ mod tests {
 
     #[test]
     fn test_build_filter_sql_and_params_with_filter() {
-        use super::super::types::SqlCondition;
-        let statement = SqlStatement {
+        use super::super::types::SqlConditionInternal;
+        let statement = SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
-            condition: Some(SqlCondition {
+            condition: Some(SqlConditionInternal {
                 key: "$.field".to_string(),
                 operator: SqlOperator::Equals,
                 value: Some(SqlValue::String("value".to_string())),

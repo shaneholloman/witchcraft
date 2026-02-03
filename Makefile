@@ -45,7 +45,7 @@ mcp: buildemb
 	cmcp "node dist/index.js" tools/call name=search 'arguments:={"q": "teenagers and acne" }'
 
 test: download
-	RUST_LOG=debug cargo llvm-cov nextest --release --features metal,accelerate --lcov --output-path lcov.info # --no-capture
+	RUST_LOG=debug cargo llvm-cov nextest --release --features napi,metal,accelerate --lcov --output-path lcov.info # --no-capture
 	genhtml lcov.info
 
 nfcorpus: build

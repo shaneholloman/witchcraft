@@ -7,13 +7,13 @@ use napi_derive::napi;
 use std::{
     path::PathBuf,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-    sync::{mpsc, Arc, Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock, mpsc},
     thread::{self, JoinHandle},
 };
 
 use uuid::Uuid;
 
-use log::{info, warn, LevelFilter, Log, Metadata, Record};
+use log::{LevelFilter, Log, Metadata, Record, info, warn};
 use napi::bindgen_prelude::*; // Env, Function, Result, etc.
 use napi::threadsafe_function::ThreadsafeCallContext;
 use once_cell::sync::OnceCell;
@@ -130,109 +130,9 @@ pub struct StatsEvent {
     pub number: f64,
 }
 
-// Node API types for SQL filtering
-#[napi(string_enum)]
-pub enum SqlOperator {
-    Equals,
-    NotEquals,
-    GreaterThan,
-    LessThan,
-    GreaterThanOrEquals,
-    LessThanOrEquals,
-    Like,
-    NotLike,
-    Exists,
-}
-
-#[napi(string_enum)]
-pub enum SqlLogic {
-    And,
-    Or,
-}
-
-#[napi(string_enum)]
-pub enum SqlStatementType {
-    Condition,
-    Group,
-    Empty,
-}
-
-#[napi(object)]
-pub struct SqlCondition {
-    pub key: String,
-    pub operator: SqlOperator,
-    pub value: Option<Either<String, f64>>,
-}
-
-#[napi(object)]
-pub struct SqlStatement {
-    pub r#type: SqlStatementType,
-    pub condition: Option<SqlCondition>,
-    pub logic: Option<SqlLogic>,
-    pub statements: Option<Vec<SqlStatement>>,
-}
-
-// Convert napi types to internal types
-impl From<SqlOperator> for warp::types::SqlOperator {
-    fn from(op: SqlOperator) -> Self {
-        match op {
-            SqlOperator::Equals => warp::types::SqlOperator::Equals,
-            SqlOperator::NotEquals => warp::types::SqlOperator::NotEquals,
-            SqlOperator::GreaterThan => warp::types::SqlOperator::GreaterThan,
-            SqlOperator::LessThan => warp::types::SqlOperator::LessThan,
-            SqlOperator::GreaterThanOrEquals => warp::types::SqlOperator::GreaterThanOrEquals,
-            SqlOperator::LessThanOrEquals => warp::types::SqlOperator::LessThanOrEquals,
-            SqlOperator::Like => warp::types::SqlOperator::Like,
-            SqlOperator::NotLike => warp::types::SqlOperator::NotLike,
-            SqlOperator::Exists => warp::types::SqlOperator::Exists,
-        }
-    }
-}
-
-impl From<SqlLogic> for warp::types::SqlLogic {
-    fn from(logic: SqlLogic) -> Self {
-        match logic {
-            SqlLogic::And => warp::types::SqlLogic::And,
-            SqlLogic::Or => warp::types::SqlLogic::Or,
-        }
-    }
-}
-
-impl From<SqlStatementType> for warp::types::SqlStatementType {
-    fn from(t: SqlStatementType) -> Self {
-        match t {
-            SqlStatementType::Condition => warp::types::SqlStatementType::Condition,
-            SqlStatementType::Group => warp::types::SqlStatementType::Group,
-            SqlStatementType::Empty => warp::types::SqlStatementType::Empty,
-        }
-    }
-}
-
-impl From<SqlCondition> for warp::types::SqlCondition {
-    fn from(cond: SqlCondition) -> Self {
-        warp::types::SqlCondition {
-            key: cond.key,
-            operator: cond.operator.into(),
-            value: cond.value.map(|v| match v {
-                Either::A(s) => warp::types::SqlValue::String(s),
-                Either::B(n) => warp::types::SqlValue::Number(n),
-            }),
-        }
-    }
-}
-
-impl From<SqlStatement> for warp::types::SqlStatement {
-    fn from(stmt: SqlStatement) -> Self {
-        warp::types::SqlStatement {
-            statement_type: stmt.r#type.into(),
-            condition: stmt.condition.map(Into::into),
-            logic: stmt.logic.map(Into::into),
-            statements: stmt
-                .statements
-                .map(|stmts| stmts.into_iter().map(Into::into).collect()),
-        }
-    }
-}
+// Re-export SQL types for NAPI
+#[cfg(feature = "napi")]
+pub use warp::types::{SqlCondition, SqlLogic, SqlOperator, SqlStatement, SqlStatementType};
 
 // Store the threadsafe function using a boxed type-erased version
 static STATSFN: OnceCell<Box<dyn Fn(StatsEvent) + Send + Sync>> = OnceCell::new();
@@ -284,6 +184,9 @@ enum Job {
     },
     Index,
     Clear,
+    Delete {
+        sql_filter: warp::types::SqlStatementInternal,
+    },
     Shutdown,
 }
 
@@ -333,6 +236,12 @@ impl Indexer {
                     Job::Clear => {
                         if let Some(db) = db.as_mut() {
                             db.clear();
+                        }
+                        CLEAR.store(false, Ordering::Release);
+                    }
+                    Job::Delete { ref sql_filter } => {
+                        if let Some(db) = db.as_mut() {
+                            let _ = db.delete_with_filter(sql_filter);
                         }
                         CLEAR.store(false, Ordering::Release);
                     }
@@ -476,6 +385,13 @@ impl Indexer {
         }
     }
 
+    pub fn delete(&self, sql_filter: warp::types::SqlStatementInternal) {
+        if accepting_commands() {
+            CLEAR.store(true, Ordering::Release);
+            let _ = self.tx.send(Job::Delete { sql_filter });
+        }
+    }
+
     pub fn shutdown(&self) {
         if accepting_commands() {
             SHUTDOWN.store(true, Ordering::Release);
@@ -516,7 +432,7 @@ impl WarpInner {
         q: &String,
         threshold: f32,
         top_k: usize,
-        sql_filter: Option<&warp::types::SqlStatement>,
+        sql_filter: Option<&warp::types::SqlStatementInternal>,
     ) -> Vec<(f32, String, String, u32)> {
         self.embedder
             .as_ref()
@@ -577,7 +493,7 @@ pub struct SearchTask {
     q: String,
     threshold: f32,
     top_k: usize,
-    sql_filter: Option<warp::types::SqlStatement>,
+    sql_filter: Option<warp::types::SqlStatementInternal>,
 }
 
 impl<'env> ScopedTask<'env> for SearchTask {
@@ -716,6 +632,11 @@ impl Warp {
     #[napi]
     pub fn clear(&self) {
         Indexer::global().clear();
+    }
+
+    #[napi]
+    pub fn delete(&self, sql_filter: SqlStatement) {
+        Indexer::global().delete(sql_filter.into());
     }
 
     #[napi]
