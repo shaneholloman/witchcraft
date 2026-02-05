@@ -1,3 +1,4 @@
+# python 3.13.1 seems compatible with all of these
 torch
 transformers
 huggingface_hub
@@ -5,3 +6,4 @@ safetensors
 zstandard
 openvino==2025.4.1
 pytrec_eval
+nncf
