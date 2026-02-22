@@ -534,6 +534,12 @@ struct CachedTensor {
 }
 
 static CACHED: Lazy<RwLock<Option<CachedTensor>>> = Lazy::new(|| RwLock::new(None));
+static CACHED_VERSION: Lazy<RwLock<Option<u64>>> = Lazy::new(|| RwLock::new(None));
+
+fn invalidate_center_cache() {
+    *CACHED.write().unwrap() = None;
+    *CACHED_VERSION.write().unwrap() = None;
+}
 
 fn get_centers(
     db: &DB,
@@ -542,15 +548,24 @@ fn get_centers(
 ) -> Result<(Vec<u32>, Vec<usize>, Vec<Tensor>, Tensor)> {
     let now = std::time::Instant::now();
     {
+        let cache_lock_start = std::time::Instant::now();
         let cache = CACHED.read().unwrap();
+        let lock_time = cache_lock_start.elapsed().as_micros();
         if let Some(cached) = &*cache {
             if cached.version == version {
-                return Ok((
+                let clone_start = std::time::Instant::now();
+                let result = Ok((
                     cached.cluster_ids.clone(),
                     cached.sizes.clone(),
                     cached.centers.clone(),
                     cached.tensor.clone(),
                 ));
+                debug!(
+                    "get_centers cache hit: lock {}μs, clone {}μs",
+                    lock_time,
+                    clone_start.elapsed().as_micros()
+                );
+                return result;
             }
         }
     }
@@ -627,12 +642,29 @@ pub fn match_centroids(
 ) -> Result<Vec<(f32, u32, u32)>> {
     let total_start = std::time::Instant::now();
     let setup_start = std::time::Instant::now();
-    let cache_version: u64 = db
-        .query("SELECT IFNULL(MAX(id), 0) + COUNT(*) FROM bucket")?
-        .query_row((), |row| Ok(row.get::<_, u64>(0)?))
-        .unwrap_or(0);
+
+    let version_start = std::time::Instant::now();
+    // Check cached version first to avoid expensive DB query
+    let cache_version: u64 = {
+        let cached_ver = CACHED_VERSION.read().unwrap();
+        if let Some(ver) = *cached_ver {
+            ver
+        } else {
+            drop(cached_ver); // Release read lock before acquiring write lock
+            let ver = db
+                .query("SELECT IFNULL(MAX(id), 0) + COUNT(*) FROM bucket")?
+                .query_row((), |row| Ok(row.get::<_, u64>(0)?))
+                .unwrap_or(0);
+            *CACHED_VERSION.write().unwrap() = Some(ver);
+            ver
+        }
+    };
+    let version_time = version_start.elapsed().as_millis();
+
+    let query_prep_start = std::time::Instant::now();
     let mut bucket_query =
         db.query("SELECT indices,residuals FROM bucket WHERE id = ?1")?;
+    let query_prep_time = query_prep_start.elapsed().as_millis();
 
     let k = 32;
     let t_prime = 40000;
@@ -644,9 +676,18 @@ pub fn match_centroids(
     let mut count = 0;
     let mut missing = vec![];
 
+    let centers_start = std::time::Instant::now();
     let (cluster_ids, sizes, centers, centers_matrix) =
         get_centers(&db, &device, cache_version)?;
-    debug!("setup and get_centers took {} ms.", setup_start.elapsed().as_millis());
+    let centers_time = centers_start.elapsed().as_millis();
+
+    debug!(
+        "setup: version query {}ms, bucket query prep {}ms, get_centers {}ms, total {}ms",
+        version_time,
+        query_prep_time,
+        centers_time,
+        setup_start.elapsed().as_millis()
+    );
 
     if centers.len() > 0 {
         let now = std::time::Instant::now();
@@ -1296,7 +1337,11 @@ pub fn full_index(db: &DB, device: &Device) -> Result<()> {
         }
     };
     match txstatus {
-        Ok(()) => Ok(db.commit_transaction()?),
+        Ok(()) => {
+            db.commit_transaction()?;
+            invalidate_center_cache();
+            Ok(())
+        }
         Err(v) => {
             warn!("failure during indexing transaction {v}");
             let _ = db.rollback_transaction();
@@ -1344,7 +1389,11 @@ fn incremental_index(db: &DB, device: &Device) -> Result<()> {
         }
     };
     match txstatus {
-        Ok(()) => Ok(db.commit_transaction()?),
+        Ok(()) => {
+            db.commit_transaction()?;
+            invalidate_center_cache();
+            Ok(())
+        }
         Err(v) => {
             warn!("failure during indexing transaction {v}");
             let _ = db.rollback_transaction();
