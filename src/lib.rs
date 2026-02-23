@@ -105,25 +105,52 @@ pub mod progress {
     }
 }
 
-fn matmul_argmax_batched(t: &Tensor, centers_t: &Tensor, batch_size: usize) -> Result<Tensor> {
-    let (m, _n) = t.dims2()?;
-    let device = t.device();
+/// Assign each row of `data` to its nearest centroid.
+/// `data`:    [m, n]
+/// `centers`: [k, n]
+/// Returns:   [m] u32 cluster indices.
+fn argmax_nearest_centroid(data: &Tensor, centers: &Tensor) -> Result<Tensor> {
+    let (m, n) = data.dims2()?;
+    let (k, _) = centers.dims2()?;
+    let device = data.device();
 
-    let mut assignments = Vec::with_capacity(m);
+    if device.is_cpu() {
+        // Pure-Rust path: stream over centroids one dot product at a time.
+        // Never materialises the [m, k] intermediate matrix, and the tight
+        // inner loop auto-vectorises to AVX2/FMA on x86_64.
+        let data_vec    = data.flatten_all()?.to_vec1::<f32>()?;
+        let centers_vec = centers.flatten_all()?.to_vec1::<f32>()?;
 
-    for start in (0..m).step_by(batch_size) {
-        let end = (start + batch_size).min(m);
-        let batch_len = end - start;
-        let batch = t.narrow(0, start, batch_len)?;
-        let sim = batch.matmul(centers_t)?;
+        let assignments: Vec<u32> = (0..m)
+            .map(|j| {
+                let emb = &data_vec[j * n..(j + 1) * n];
+                let mut best_score = f32::NEG_INFINITY;
+                let mut best_idx   = 0u32;
+                for i in 0..k {
+                    let cen = &centers_vec[i * n..(i + 1) * n];
+                    let score: f32 = emb.iter().zip(cen).map(|(a, b)| a * b).sum();
+                    if score > best_score {
+                        best_score = score;
+                        best_idx   = i as u32;
+                    }
+                }
+                best_idx
+            })
+            .collect();
 
-        // Use vectorized argmax for CPU tensors
-        let batch_assignments = sim.argmax(D::Minus1)?;
-        let batch_assignments = batch_assignments.to_vec1::<u32>()?;
-        assignments.extend(batch_assignments);
+        Ok(Tensor::from_vec(assignments, m, device)?)
+    } else {
+        // GPU path: matmul + argmax, batched to limit intermediate memory.
+        let centers_t = centers.transpose(D::Minus1, D::Minus2)?;
+        let mut assignments = Vec::with_capacity(m);
+        for start in (0..m).step_by(1024) {
+            let end   = (start + 1024).min(m);
+            let batch = data.narrow(0, start, end - start)?;
+            let sim   = batch.matmul(&centers_t)?;
+            assignments.extend(sim.argmax(D::Minus1)?.to_vec1::<u32>()?);
+        }
+        Ok(Tensor::from_vec(assignments, m, device)?)
     }
-
-    Ok(Tensor::from_vec(assignments, m, device)?)
 }
 
 fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<Tensor> {
@@ -142,8 +169,7 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<T
     let mut centers = data.index_select(&centroid_idx_tensor, 0)?;
 
     for _ in 0..max_iter {
-        // Use batched matmul+argmax to avoid materializing huge [m, k] matrix
-        let cluster_assignments = matmul_argmax_batched(&data, &centers.transpose(D::Minus1, D::Minus2)?, 1024)?;
+        let cluster_assignments = argmax_nearest_centroid(&data, &centers)?;
         let mut centers_vec = vec![];
         for i in 0..k {
             let mut indices = vec![];
@@ -269,7 +295,6 @@ fn write_buckets(
     let mut batch = 0;
     let mut tmpfiles = vec![];
     let centers_cpu = centers.to_device(&Device::Cpu)?;
-    let centers_t = centers.transpose(D::Minus1, D::Minus2)?;
     while !done {
         match results.next() {
             Some(result) => {
@@ -309,8 +334,7 @@ fn write_buckets(
             let indices = document_indices.split_off(left);
             let data = Tensor::cat(&embeddings, 0)?.to_device(&device)?;
 
-            // Use batched matmul+argmax to avoid materializing huge intermediate matrix
-            let cluster_assignments = matmul_argmax_batched(&data, &centers_t, 1024)?.to_device(&Device::Cpu)?;
+            let cluster_assignments = argmax_nearest_centroid(&data, &centers)?.to_device(&Device::Cpu)?;
             info!("simmax took {} ms", now.elapsed().as_millis());
             mmuls_total += now.elapsed().as_millis();
 
