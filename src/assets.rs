@@ -38,6 +38,27 @@ impl Asset {
         }
     }
 
+    /// Decompress directly into a file without buffering the entire payload in RAM.
+    pub fn decompress_to_file(&'static self, _assets: &PathBuf, dest: &Path) -> Result<(), ()> {
+        let mut out = std::fs::File::create(dest)
+            .map_err(|e| log::warn!("failed to create {}: {}", dest.display(), e))?;
+
+        #[cfg(feature = "embed-assets")]
+        zstd::stream::copy_decode(&mut Cursor::new(self.compressed), &mut out)
+            .map_err(|e| log::warn!("failed to decompress asset: {}", e))?;
+
+        #[cfg(not(feature = "embed-assets"))]
+        {
+            let src = _assets.join(self.path);
+            let mut reader = std::fs::File::open(&src)
+                .map_err(|e| log::warn!("failed to open {}: {}", src.display(), e))?;
+            zstd::stream::copy_decode(&mut reader, &mut out)
+                .map_err(|e| log::warn!("failed to decompress asset: {}", e))?;
+        }
+
+        Ok(())
+    }
+
     /// Return the decompressed bytes; performs work only on first call.
     pub fn bytes(&'static self, _assets: &PathBuf) -> Result<&'static [u8], ()> {
         self.decompressed

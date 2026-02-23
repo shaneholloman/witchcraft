@@ -47,23 +47,19 @@ impl T5ModelBuilder {
 
     /// Build the T5 encoder model using OpenVINO with INT4 quantization.
     pub fn build_encoder(&self, device: &Device, assets: &PathBuf) -> Result<T5EncoderModel> {
-        // Decompress model files from embedded assets
-        let xml_bytes = MODEL_INT4_XML.bytes(assets)
-            .map_err(|_| anyhow!("failed to get decompressed bytes for INT4 MODEL_XML"))?;
-        let bin_bytes = MODEL_INT4_BIN.bytes(assets)
-            .map_err(|_| anyhow!("failed to get decompressed bytes for INT4 MODEL_BIN"))?;
-
-        // Create temporary directory for model files
-        // OpenVINO's read_model API requires file paths
+        // Decompress model files directly to a temp directory.
+        // OpenVINO's read_model API requires file paths, and streaming avoids
+        // buffering the full ~130 MB payload in RAM before writing.
         let temp_dir = tempfile::tempdir()
             .map_err(|e| anyhow!("failed to create temp directory: {}", e))?;
         let xml_path = temp_dir.path().join("model-int4.xml");
         let bin_path = temp_dir.path().join("model-int4.bin");
 
-        std::fs::write(&xml_path, xml_bytes)
-            .map_err(|e| anyhow!("failed to write model.xml: {}", e))?;
-        std::fs::write(&bin_path, bin_bytes)
-            .map_err(|e| anyhow!("failed to write model.bin: {}", e))?;
+        log::info!("decompressing OpenVINO model files...");
+        MODEL_INT4_XML.decompress_to_file(assets, &xml_path)
+            .map_err(|_| anyhow!("failed to decompress INT4 MODEL_XML"))?;
+        MODEL_INT4_BIN.decompress_to_file(assets, &bin_path)
+            .map_err(|_| anyhow!("failed to decompress INT4 MODEL_BIN"))?;
 
         // Initialize OpenVINO Core
         let mut core = Core::new()
