@@ -4,6 +4,6 @@ transformers
 huggingface_hub
 safetensors
 zstandard
-openvino==2025.4.1
+openvino==2026.0.0
 pytrec_eval
 nncf

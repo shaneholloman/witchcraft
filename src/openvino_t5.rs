@@ -34,6 +34,27 @@ impl T5ModelBuilder {
     /// This method loads the config.json and tokenizer.json files,
     /// which are shared across all T5 backend implementations.
     pub fn load(assets: &PathBuf) -> Result<(Self, Tokenizer)> {
+        // On Windows, add assets directory to PATH early if it contains OpenVINO DLLs
+        // This must happen before any OpenVINO code loads
+        #[cfg(all(target_os = "windows", feature = "t5-openvino"))]
+        {
+            let dll_file = assets.join("openvino_c.dll");
+            if dll_file.exists() {
+                // Get absolute path
+                let abs_assets = assets.canonicalize().unwrap_or_else(|_| assets.clone());
+                if let Some(assets_str) = abs_assets.to_str() {
+                    // Add to PATH environment variable at the front
+                    if let Ok(current_path) = std::env::var("PATH") {
+                        let new_path = format!("{};{}", assets_str, current_path);
+                        unsafe {
+                            std::env::set_var("PATH", new_path);
+                        }
+                        log::info!("[INFO] Added assets directory to PATH for OpenVINO DLLs: {}", assets_str);
+                    }
+                }
+            }
+        }
+
         // Load tokenizer
         let tok_bytes = TOKENIZER
             .bytes(assets)
