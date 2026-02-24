@@ -76,18 +76,34 @@ pub fn make_device() -> Device {
 
 #[cfg(all(feature = "progress", not(feature = "napi")))]
 pub mod progress {
-    use indicatif::ProgressBar;
-    pub struct Bar(pub ProgressBar);
+    use indicatif::{ProgressBar, ProgressStyle};
+    pub struct Bar {
+        pb: ProgressBar,
+        label: String,
+    }
     pub fn new(len: u64) -> Bar {
+        new_with_label(len, "")
+    }
+    pub fn new_with_label(len: u64, label: &str) -> Bar {
         let pb = ProgressBar::new(len);
-        Bar(pb)
+        if !label.is_empty() {
+            let style = ProgressStyle::default_bar()
+                .template(&format!("{{msg}} [{{bar:40}}] {{pos}}/{{len}}"))
+                .unwrap();
+            pb.set_style(style);
+            pb.set_message(label.to_string());
+        }
+        Bar {
+            pb,
+            label: label.to_string(),
+        }
     }
     impl Bar {
         pub fn inc(&self, n: u64) {
-            self.0.inc(n);
+            self.pb.inc(n);
         }
         pub fn finish(&self) {
-            self.0.finish();
+            self.pb.finish();
         }
     }
 }
@@ -98,11 +114,16 @@ pub mod progress {
     pub struct Bar {
         total: u64,
         current: AtomicU64,
+        label: String,
     }
     pub fn new(len: u64) -> Bar {
+        new_with_label(len, "")
+    }
+    pub fn new_with_label(len: u64, label: &str) -> Bar {
         Bar {
             total: len,
             current: AtomicU64::new(0),
+            label: label.to_string(),
         }
     }
     impl Bar {
@@ -111,12 +132,12 @@ pub mod progress {
             if self.total > 0 {
                 let progress = (current as f64) / (self.total as f64);
                 #[cfg(feature = "napi")]
-                crate::napi::progress_update(progress.min(1.0));
+                crate::napi::progress_update(progress.min(1.0), &self.label);
             }
         }
         pub fn finish(&self) {
             #[cfg(feature = "napi")]
-            crate::napi::progress_update(1.0);
+            crate::napi::progress_update(1.0, &self.label);
         }
     }
 }
@@ -125,7 +146,11 @@ pub mod progress {
 pub mod progress {
     #[derive(Clone, Copy)]
     pub struct Bar;
+    #[allow(dead_code)]
     pub fn new(_len: u64) -> Bar {
+        Bar
+    }
+    pub fn new_with_label(_len: u64, _label: &str) -> Bar {
         Bar
     }
     impl Bar {
@@ -158,7 +183,7 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize, device: &Device) -> Result<T
     debug!("kmeans k={} m={} n={}...", k, m, n);
 
     let total: u64 = (max_iter * k).try_into()?;
-    let bar = progress::new(total);
+    let bar = progress::new_with_label(total, "kmeans");
 
     let mut rng = rand::rng();
     let centroid_idx = rand::seq::index::sample(&mut rng, m, k).into_vec();
@@ -288,7 +313,7 @@ fn write_buckets(
     let mut mmuls_total = 0;
     let mut writes_total = 0;
 
-    let bar = progress::new(expected_count);
+    let bar = progress::new_with_label(expected_count, "indexing");
 
     let mut document_indices = Vec::<(u32, u32)>::new();
     let mut all_chunkids = vec![];

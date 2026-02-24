@@ -168,36 +168,46 @@ pub fn stats(name: &str, number: f64) {
     }
 }
 
+#[napi(object)]
+pub struct ProgressEvent {
+    pub progress: f64,
+    pub phase: String,
+}
+
 // Store the threadsafe function for progress updates
-static PROGRESSFN: OnceCell<Box<dyn Fn(f64) + Send + Sync>> = OnceCell::new();
+static PROGRESSFN: OnceCell<Box<dyn Fn(ProgressEvent) + Send + Sync>> = OnceCell::new();
 
 #[napi]
-pub fn set_progress_callback(callback: Function<(f64,), Unknown>) -> Result<()> {
+pub fn set_progress_callback(callback: Function<(ProgressEvent,), Unknown>) -> Result<()> {
     use napi::threadsafe_function::ThreadsafeFunctionCallMode;
 
     // Safety: We're intentionally leaking the callback reference to make it 'static
     // This is okay because we only set the callback once and it lives for the duration of the program
-    let callback_static: Function<'static, (f64,), Unknown> =
+    let callback_static: Function<'static, (ProgressEvent,), Unknown> =
         unsafe { std::mem::transmute(callback) };
 
     let tsfn = callback_static.build_threadsafe_function().build_callback(
-        |ctx: ThreadsafeCallContext<(f64,)>| {
-            // Pass the progress value (0.0 to 1.0)
+        |ctx: ThreadsafeCallContext<(ProgressEvent,)>| {
+            // Pass the progress event with value and phase
             Ok(ctx.value.0)
         },
     )?;
 
     // Wrap the threadsafe function in a closure that we can store
-    let _ = PROGRESSFN.set(Box::new(move |progress: f64| {
-        let _ = tsfn.call((progress,), ThreadsafeFunctionCallMode::NonBlocking);
+    let _ = PROGRESSFN.set(Box::new(move |evt: ProgressEvent| {
+        let _ = tsfn.call((evt,), ThreadsafeFunctionCallMode::NonBlocking);
     }));
 
     Ok(())
 }
 
-pub fn progress_update(progress: f64) {
+pub fn progress_update(progress: f64, phase: &str) {
     if let Some(callback) = PROGRESSFN.get() {
-        callback(progress);
+        let evt = ProgressEvent {
+            progress,
+            phase: phase.to_string(),
+        };
+        callback(evt);
     }
 }
 
