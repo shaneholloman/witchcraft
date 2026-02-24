@@ -10,7 +10,6 @@
 //! - Cross-platform support (Windows, macOS)
 //! - Compatible with existing embedder interface
 
-use log::debug;
 use crate::embed_zst_asset;
 use anyhow::{anyhow, Result};
 use candle_core::{Device, Tensor};
@@ -108,6 +107,15 @@ impl T5ModelBuilder {
     }
 }
 
+/// Round up to the next power of 2, with a minimum of 64.
+/// This limits the number of distinct shapes OpenVINO sees, preventing
+/// a memory leak in its CPU plugin that occurs on every shape transition.
+fn bucket_size(n: usize) -> usize {
+    let min = 64;
+    if n <= min { return min; }
+    n.next_power_of_two()
+}
+
 /// T5 Encoder Model using OpenVINO backend.
 ///
 /// This struct wraps an OpenVINO compiled model and inference request,
@@ -121,16 +129,9 @@ pub struct T5EncoderModel {
 impl T5EncoderModel {
     /// Perform forward pass through the T5 encoder.
     ///
-    /// This method converts the input Candle tensor to OpenVINO format,
-    /// runs inference, and converts the output back to a Candle tensor.
-    ///
-    /// # Arguments
-    /// * `input_ids` - Input token IDs as a Candle tensor [batch_size, seq_len]
-    ///
-    /// # Returns
-    /// Output embeddings as a Candle tensor [batch_size, seq_len, embedding_dim]
+    /// Pads input to a power-of-2 bucket size to work around an OpenVINO CPU
+    /// plugin memory leak triggered by frequent input shape changes.
     pub fn forward(&self, input_ids: &Tensor) -> Result<Tensor> {
-        // Get input dimensions
         let shape = input_ids.shape();
         let dims = shape.dims();
         if dims.len() != 2 {
@@ -141,121 +142,69 @@ impl T5EncoderModel {
         }
         let batch_size = dims[0];
         let seq_len = dims[1];
+        let padded_len = bucket_size(seq_len);
 
-        // Convert Candle tensor to Vec<i64>
         let input_data: Vec<u32> = input_ids
             .flatten_all()?
             .to_vec1::<u32>()
             .map_err(|e| anyhow!("failed to convert input tensor to vec: {}", e))?;
 
-        let input_data: Vec<i64> = input_data.into_iter()
-            .map(i64::from) // or .map(|x| x.into())
-            .collect();
+        // Pad with 0 (T5 pad token) to the bucket size
+        let mut padded: Vec<i64> = input_data.into_iter().map(i64::from).collect();
+        padded.resize(batch_size * padded_len, 0);
 
-        // Create OpenVINO shape (OpenVINO uses i64 for dimensions)
-        let ov_shape = Shape::new(&[batch_size as i64, seq_len as i64])
+        let ov_shape = Shape::new(&[batch_size as i64, padded_len as i64])
             .map_err(|e| anyhow!("failed to create OpenVINO shape: {:?}", e))?;
 
-        // Create OpenVINO tensor
         let mut ov_input = openvino::Tensor::new(
             openvino::ElementType::I64,
             &ov_shape
         ).map_err(|e| anyhow!("failed to create OpenVINO input tensor: {:?}", e))?;
 
-        // Set tensor data
-        let ov_data = ov_input.get_data_mut::<i64>()
-            .map_err(|e| anyhow!("failed to get mutable data: {:?}", e))?;
-
-        debug!("[DEBUG] OpenVINO tensor buffer size: {}, input data size: {}", ov_data.len(), input_data.len());
-        if ov_data.len() != input_data.len() {
-            return Err(anyhow!("SIZE MISMATCH: OpenVINO buffer has {} elements but input has {} elements!",
-                ov_data.len(), input_data.len()));
-        }
-
-        ov_data.copy_from_slice(&input_data);
+        ov_input.get_data_mut::<i64>()
+            .map_err(|e| anyhow!("failed to get mutable data: {:?}", e))?
+            .copy_from_slice(&padded);
 
         let mut infer_request = self.ov_infer_request.borrow_mut();
 
-        // Set input tensor (no index parameter needed)
         infer_request
             .set_input_tensor(&ov_input)
             .map_err(|e| anyhow!("failed to set input tensor: {:?}", e))?;
 
-        // Run inference
         infer_request
             .infer()
             .map_err(|e| anyhow!("OpenVINO inference failed: {:?}", e))?;
 
-        // Get output tensor (no index parameter needed)
         let ov_output = infer_request
             .get_output_tensor()
             .map_err(|e| anyhow!("failed to get output tensor: {:?}", e))?;
 
-        // Get output shape and data
         let output_shape = ov_output.get_shape()
             .map_err(|e| anyhow!("failed to get output shape: {:?}", e))?;
 
-        // Convert Shape to Vec<usize> - OpenVINO uses i64 for dimensions
         let output_dims: Vec<usize> = output_shape
             .get_dimensions()
             .iter()
             .map(|&d| d as usize)
             .collect();
 
-        // Copy data from OpenVINO tensor
+        let embedding_dim = *output_dims.last()
+            .ok_or_else(|| anyhow!("empty output dimensions"))?;
+
         let output_data: Vec<f32> = ov_output.get_data::<f32>()
             .map_err(|e| anyhow!("failed to get output data: {:?}", e))?
             .to_vec();
 
-        /*
-        // Debug: Check for NaN values
-        let has_nan = output_data.iter().any(|x| x.is_nan());
-        let has_inf = output_data.iter().any(|x| x.is_infinite());
-        if has_nan || has_inf {
-            warn!("OpenVINO output contains NaN={} Inf={}", has_nan, has_inf);
-            warn!("First 10 values: {:?}", &output_data[..10.min(output_data.len())]);
-            warn!("Last 10 values: {:?}", &output_data[output_data.len().saturating_sub(10)..]);
+        // Slice off padding: keep only the first seq_len token embeddings
+        let unpadded: Vec<f32> = output_data.chunks(padded_len * embedding_dim)
+            .flat_map(|batch| batch[..seq_len * embedding_dim].iter().copied())
+            .collect();
 
-            // Find which rows have NaN
-            let embedding_dim = output_dims[2];
-            let num_tokens = output_dims[1];
-            let mut nan_rows: Vec<usize> = vec![];
-            for row in 0..num_tokens {
-                let row_start = row * embedding_dim;
-                let row_data = &output_data[row_start..row_start + embedding_dim];
-                if row_data.iter().any(|x| x.is_nan()) {
-                    nan_rows.push(row);
-                }
-            }
-            warn!("Rows with NaN (total {} out of {}): {:?}", nan_rows.len(), num_tokens, nan_rows);
-            warn!("Input dimensions: batch={}, seq_len={}", batch_size, seq_len);
-            warn!("Output dimensions: {:?}", output_dims);
-
-            // Show input tokens at NaN positions
-            warn!("Input token IDs (first 20): {:?}", &input_data[..20.min(input_data.len())]);
-            warn!("Input token IDs (last 20): {:?}", &input_data[input_data.len().saturating_sub(20)..]);
-            if nan_rows.len() <= 10 {
-                warn!("Token IDs at NaN row positions:");
-                for &row_idx in &nan_rows {
-                    if row_idx < input_data.len() {
-                        warn!("  Row {}: token_id={}", row_idx, input_data[row_idx]);
-                    }
-                }
-            }
-
-            // Check if last row has NaN
-            if nan_rows.contains(&(num_tokens - 1)) {
-                warn!("LAST ROW (index {}) HAS NaN!", num_tokens - 1);
-                warn!("This suggests an off-by-one error or padding issue");
-            }
-
-            assert!(false);
-        }
-        */
-
-        // Convert back to Candle tensor
-        let output_tensor = Tensor::from_vec(output_data, &output_dims[..], &self.device)
-            .map_err(|e| anyhow!("failed to create output Candle tensor: {}", e))?;
+        let output_tensor = Tensor::from_vec(
+            unpadded,
+            &[batch_size, seq_len, embedding_dim],
+            &self.device,
+        ).map_err(|e| anyhow!("failed to create output Candle tensor: {}", e))?;
 
         Ok(output_tensor)
     }
