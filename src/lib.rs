@@ -1305,6 +1305,9 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
         };
     }
     debug!("embedded {count} chunks");
+    if count > 0 {
+        db.checkpoint();
+    }
     Ok(count)
 }
 
@@ -1483,11 +1486,15 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
         unindexed, indexed, total_buckets, expected_k
     );
 
-    if indexed == 0 || unindexed > indexed / 2 || total_buckets > expected_k * 10 {
+    let result = if indexed == 0 || unindexed > indexed / 2 || total_buckets > expected_k * 10 {
         full_index(db, device)
     } else {
         incremental_index(db, device)
+    };
+    if result.is_ok() {
+        db.checkpoint();
     }
+    result
 }
 
 use lru::LruCache;

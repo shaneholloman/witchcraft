@@ -188,12 +188,14 @@ impl DB {
 
     pub fn shutdown(&mut self) {
         if let Some(connection) = self.connection.take() {
+            // Checkpoint and truncate the WAL file so the main .sqlite file is
+            // self-contained on exit (no stale -wal / -shm files left behind).
+            let _ = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
             match connection.close() {
                 Ok(_) => {
                 },
                 Err((conn, e)) => {
                     error!("failed to close db connection: {e}");
-                    // Drop the returned connection explicitly
                     drop(conn);
                 }
             };
@@ -213,6 +215,16 @@ impl DB {
             // Also remove WAL and SHM files if they exist
             let _ = std::fs::remove_file(self.db_fn.with_extension("wal"));
             let _ = std::fs::remove_file(self.db_fn.with_extension("shm"));
+        }
+    }
+
+    /// Checkpoint and truncate the WAL into the main database file.
+    /// Safe to call at any point when no statements are active on this connection.
+    pub fn checkpoint(&self) {
+        if let Some(connection) = self.connection.as_ref() {
+            if let Err(e) = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)") {
+                warn!("wal_checkpoint failed: {e}");
+            }
         }
     }
 
@@ -344,8 +356,8 @@ impl DB {
 
 impl Drop for DB {
     fn drop(&mut self) {
-        // If connection is still present, close it
         if let Some(connection) = self.connection.take() {
+            let _ = connection.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
             match connection.close() {
                 Ok(_) => {},
                 Err((conn, e)) => {
