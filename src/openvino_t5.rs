@@ -13,7 +13,7 @@
 use crate::{embed_raw_asset, embed_zst_asset};
 use anyhow::{anyhow, Result};
 use candle_core::{Device, Tensor};
-use openvino::{Core, DeviceType, InferRequest, Shape};
+use openvino::{CompiledModel, Core, DeviceType, InferRequest, Shape};
 use std::cell::RefCell;
 use std::path::PathBuf;
 use tokenizers::Tokenizer;
@@ -142,6 +142,8 @@ impl T5ModelBuilder {
         Ok(T5EncoderModel {
             ov_infer_request: RefCell::new(infer_request),
             device: device.clone(),
+            _compiled_model: compiled_model,
+            _core: core,
         })
     }
 }
@@ -164,6 +166,10 @@ fn bucket_size(n: usize) -> usize {
 pub struct T5EncoderModel {
     ov_infer_request: RefCell<InferRequest>,
     device: Device,
+    // Prevent premature destruction of the C++ objects backing the InferRequest.
+    // Rust drops fields in declaration order, so IR drops before these.
+    _compiled_model: CompiledModel,
+    _core: Core,
 }
 
 impl T5EncoderModel {
@@ -234,6 +240,10 @@ impl T5EncoderModel {
         let output_data: Vec<f32> = ov_output.get_data::<f32>()
             .map_err(|e| anyhow!("failed to get output data: {:?}", e))?
             .to_vec();
+
+        // Prevent ov_tensor_free on the IR's internal output buffer.
+        // See OPENVINO_INT4_CRASHES.md "The mem::forget wrappers" section.
+        std::mem::forget(ov_output);
 
         // Slice off padding: keep only the first seq_len token embeddings
         let unpadded: Vec<f32> = output_data.chunks(padded_len * embedding_dim)
