@@ -253,6 +253,10 @@ impl MatMul {
     pub fn from_qtensor(qt: Arc<QTensor>) -> Self {
         Self::QTensor(qt)
     }
+
+    pub fn from_tensor(t: Tensor) -> Self {
+        Self::Tensor(t)
+    }
 }
 
 impl Module for MatMul {

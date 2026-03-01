@@ -1,6 +1,6 @@
 // Standalone copy of quantized_t5.rs for benchmarking (no embed_zst_asset dependency).
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::{DType, Module, Result, Tensor, D};
 use candle_nn::Activation;
 use candle_transformers::models::t5::{
     deserialize_feed_forward_proj_activation, ActivationWithOptionalGating,
@@ -24,6 +24,13 @@ fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
 fn new_qmm(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
     let ws = vb.get((out_d, in_d), "weight")?;
     Ok(QMatMul::from_qtensor(ws))
+}
+
+#[cfg(feature = "fused-gelu")]
+fn new_qmm_dequant(in_d: usize, out_d: usize, vb: VarBuilder) -> Result<QMatMul> {
+    let ws = vb.get((out_d, in_d), "weight")?;
+    let tensor = ws.dequantize(vb.device())?;
+    Ok(QMatMul::from_tensor(tensor))
 }
 
 fn default_relative_attention_max_distance() -> usize {
@@ -223,10 +230,22 @@ struct T5Attention {
 impl T5Attention {
     fn load(has_relative_attention_bias: bool, vb: VarBuilder, cfg: &Config) -> Result<Self> {
         let inner_dim = cfg.num_heads * cfg.d_kv;
-        let q = new_qmm(cfg.d_model, inner_dim, vb.pp("q"))?;
-        let k = new_qmm(cfg.d_model, inner_dim, vb.pp("k"))?;
-        let v = new_qmm(cfg.d_model, inner_dim, vb.pp("v"))?;
-        let o = new_qmm(inner_dim, cfg.d_model, vb.pp("o"))?;
+        #[cfg(feature = "fused-gelu")]
+        let (q, k, v, o) = {
+            let q = new_qmm_dequant(cfg.d_model, inner_dim, vb.pp("q"))?;
+            let k = new_qmm_dequant(cfg.d_model, inner_dim, vb.pp("k"))?;
+            let v = new_qmm_dequant(cfg.d_model, inner_dim, vb.pp("v"))?;
+            let o = new_qmm_dequant(inner_dim, cfg.d_model, vb.pp("o"))?;
+            (q, k, v, o)
+        };
+        #[cfg(not(feature = "fused-gelu"))]
+        let (q, k, v, o) = {
+            let q = new_qmm(cfg.d_model, inner_dim, vb.pp("q"))?;
+            let k = new_qmm(cfg.d_model, inner_dim, vb.pp("k"))?;
+            let v = new_qmm(cfg.d_model, inner_dim, vb.pp("v"))?;
+            let o = new_qmm(inner_dim, cfg.d_model, vb.pp("o"))?;
+            (q, k, v, o)
+        };
         let relative_attention_bias = if has_relative_attention_bias {
             let emb = Embedding::new(
                 cfg.relative_attention_num_buckets,
