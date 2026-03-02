@@ -36,12 +36,8 @@ winmodule:
 win: download
 	RUSTFLAGS='-C target-feature=+avx2' cargo xwin build --release --target x86_64-pc-windows-msvc --features embed-assets
 
-/tmp/onnxruntime-osx-x86_64-1.23.0/lib/libonnxruntime.dylib:
-	curl -L -o /tmp/onnxruntime-x86.tgz https://github.com/microsoft/onnxruntime/releases/download/v1.23.0/onnxruntime-osx-x86_64-1.23.0.tgz
-	cd /tmp && tar xzf onnxruntime-x86.tgz && rm onnxruntime-x86.tgz
-
-macintel: download /tmp/onnxruntime-osx-x86_64-1.23.0/lib/libonnxruntime.dylib
-	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,hybrid-dequant,accelerate --bin warp-cli
+macintel: download
+	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,accelerate,hybrid-dequant
 
 macintelasan: download
 	rustup override set nightly
