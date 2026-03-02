@@ -16,9 +16,6 @@ path = "src/lib.rs"
 
 [dependencies]
 openvino = { version = "0.9.1", features = ["runtime-linking"], optional = true }
-ort = { version = "2.0.0-rc.11", optional = true }
-ndarray = { version = "0.16", optional = true }
-memmap2 = { version = "0.9", optional = true }
 anyhow = "*"
 serde = "*"
 serde_json = "*"
@@ -75,11 +72,9 @@ napi-build = "2.2.3"
 [features]
 #default = ["t5-quantized"]
 #default = ["t5-openvino"]
-#default = ["t5-onnx"]
 napi = ["dep:napi", "dep:napi-derive"]
 t5-quantized = []
 t5-openvino = ["dep:openvino"]
-t5-onnx = ["dep:ort", "dep:ndarray", "dep:memmap2"]
 embed-assets = []
 progress = ["dep:indicatif"]
 accelerate = ["dep:libc", "dep:accelerate-src"]

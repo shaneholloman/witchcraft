@@ -34,6 +34,15 @@ impl CustomOp2 for FastAddOp {
 }
 
 /// Element-wise add bypassing candle's generic binary op dispatch.
+/// On Metal/GPU, falls back to candle's built-in addition since custom ops
+/// have overhead on GPU and the optimization is CPU-specific.
 pub fn fast_add(a: &Tensor, b: &Tensor) -> Result<Tensor> {
-    a.apply_op2_no_bwd(b, &FastAddOp)
+    // Check if we're on Metal device
+    if matches!(a.device(), candle_core::Device::Metal(_)) {
+        // Use candle's built-in addition for Metal
+        a + b
+    } else {
+        // Use fast CPU implementation
+        a.apply_op2_no_bwd(b, &FastAddOp)
+    }
 }

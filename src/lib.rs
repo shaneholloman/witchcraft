@@ -18,25 +18,19 @@ mod openvino_t5;
 #[cfg(feature = "t5-openvino")]
 use openvino_t5 as t5_encoder;
 
-#[cfg(feature = "t5-onnx")]
-mod onnx_t5;
-#[cfg(feature = "t5-onnx")]
-use onnx_t5 as t5_encoder;
-
 // Compile-time checks for mutual exclusivity
 #[cfg(not(any(
     feature = "t5-quantized",
-    feature = "t5-openvino",
-    feature = "t5-onnx"
+    feature = "t5-openvino"
 )))]
-compile_error!("Must enable exactly one T5 backend: t5-quantized, t5-openvino, or t5-onnx");
+compile_error!("Must enable exactly one T5 backend: t5-quantized or t5-openvino");
 
-#[cfg(any(
-    all(feature = "t5-quantized", feature = "t5-openvino"),
-    all(feature = "t5-quantized", feature = "t5-onnx"),
-    all(feature = "t5-openvino", feature = "t5-onnx")
-))]
+#[cfg(all(feature = "t5-quantized", feature = "t5-openvino"))]
 compile_error!("Cannot enable multiple T5 backends simultaneously");
+
+// hybrid-dequant is a CPU-only optimization and cannot be used with Metal
+#[cfg(all(feature = "hybrid-dequant", feature = "metal"))]
+compile_error!("hybrid-dequant is incompatible with metal (use accelerate only for CPU, or metal without hybrid-dequant for GPU)");
 
 mod db;
 pub use db::DB;
