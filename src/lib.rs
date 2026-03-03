@@ -194,7 +194,7 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
     let (m, n) = data.dims2()?;
     debug!("kmeans k={} m={} n={}...", k, m, n);
 
-    let mut priority_mgr = PriorityManager::new();
+    let _priority_mgr = PriorityManager::new();
     let total: u64 = (max_iter * k).try_into()?;
     let bar = progress::new_with_label(total, "kmeans");
     let device = data.device();
@@ -211,7 +211,6 @@ fn kmeans(data: &Tensor, k: usize, max_iter: usize) -> Result<Tensor> {
     let data_flat = data.flatten_all()?.to_vec1::<f32>()?;
 
     for _ in 0..max_iter {
-        priority_mgr.check_and_adjust();
         let centers_t = centers.transpose(D::Minus1, D::Minus2)?;
         let cluster_assignments = matmul_argmax_batched(&data, &centers_t, 1024)?;
         let assignments = cluster_assignments.to_vec1::<u32>()?;
@@ -326,7 +325,7 @@ fn write_buckets(
     embeddings_sql: &str,
     expected_count: u64,
 ) -> Result<(Vec<tempfile::NamedTempFile>, Vec<u32>, Tensor)> {
-    let mut priority_mgr = PriorityManager::new();
+    let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
     let mut writes_total = 0;
 
@@ -353,8 +352,6 @@ fn write_buckets(
     let centers_cpu = centers.to_device(&Device::Cpu)?;
     let centers_t = centers.transpose(D::Minus1, D::Minus2)?;
     while !done {
-        priority_mgr.check_and_adjust();
-
         match results.next() {
             Some(result) => {
                 let (id, chunkid, embeddings, counts) = result?;
@@ -1259,7 +1256,7 @@ fn stretch_rows(a: &Tensor) -> Result<Tensor> {
 }
 
 pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Result<usize> {
-    let mut priority_mgr = PriorityManager::new();
+    let _priority_mgr = PriorityManager::new();
 
     // Count total documents to embed for progress reporting
     let mut progress = {
@@ -1296,8 +1293,6 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
     let embedding_iter = Gatherer::new(&mut query, embedder);
     let mut count = 0;
     for (hash, embeddings, counts) in embedding_iter {
-        priority_mgr.check_and_adjust();
-
         debug!(
             "got embedding for chunk with hash {} {:?} {:?}",
             hash,
