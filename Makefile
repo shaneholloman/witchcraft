@@ -59,4 +59,3 @@ nfcorpus: download
 	cargo run --release --features metal,t5-quantized,progress  --bin warp-cli readcsv datasets/nfcorpus.tsv
 	cargo run --release --features metal,t5-quantized,progress --bin warp-cli embed
 	cargo run --release --features metal,t5-quantized,progress --bin warp-cli index
-quantize_int4.py
