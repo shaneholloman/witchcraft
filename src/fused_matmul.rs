@@ -16,6 +16,16 @@ use std::sync::Arc;
 use fbgemm_rs::PackedMatrix;
 #[cfg(target_arch = "x86_64")]
 use fbgemm_rs::PackedBMatrixI8;
+#[cfg(target_arch = "x86_64")]
+use fbgemm_rs::I8GemmScratch;
+
+#[cfg(target_arch = "x86_64")]
+use std::cell::RefCell;
+
+#[cfg(target_arch = "x86_64")]
+thread_local! {
+    static I8_SCRATCH: RefCell<I8GemmScratch> = RefCell::new(I8GemmScratch::new());
+}
 
 fn as_block_slice<T>(data: &[u8]) -> &[T] {
     let size = std::mem::size_of::<T>();
@@ -321,7 +331,9 @@ impl CustomOp1 for I8FbgemmOp {
         let slice = &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
         let mut dst_storage = vec![0f32; dst_shape.elem_count()];
 
-        fbgemm_rs::quantized::i8gemm_f32_par(m, slice, &self.packed, self.b_scale, &mut dst_storage);
+        I8_SCRATCH.with_borrow_mut(|scratch| {
+            fbgemm_rs::i8gemm_f32_par_with_scratch(m, slice, &self.packed, self.b_scale, &mut dst_storage, scratch);
+        });
 
         Ok((CpuStorage::F32(dst_storage), dst_shape))
     }
