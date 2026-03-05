@@ -2,30 +2,15 @@
 //!
 //! Provides `MatMul`, a drop-in replacement for candle's `QMatMul` that uses
 //! column-tiled loops for better L1 cache behavior on x86.
-//! Pre-dequantized weights use fbgemm-rs: INT8 packed GEMM on x86_64,
-//! F32 packed GEMM elsewhere.
+//! Pre-dequantized weights use fbgemm-rs F32 packed GEMM.
 
 use candle_core::backend::BackendStorage;
 use candle_core::quantized::k_quants::*;
 use candle_core::quantized::{GgmlDType, GgmlType, QTensor};
 use candle_core::{CpuStorage, CustomOp1, DType, Layout, Module, Result, Shape, Tensor};
+use fbgemm_rs::PackedMatrix;
 use rayon::prelude::*;
 use std::sync::Arc;
-
-#[cfg(not(target_arch = "x86_64"))]
-use fbgemm_rs::PackedMatrix;
-#[cfg(target_arch = "x86_64")]
-use fbgemm_rs::PackedBMatrixI8;
-#[cfg(target_arch = "x86_64")]
-use fbgemm_rs::I8GemmScratch;
-
-#[cfg(target_arch = "x86_64")]
-use std::cell::RefCell;
-
-#[cfg(target_arch = "x86_64")]
-thread_local! {
-    static I8_SCRATCH: RefCell<I8GemmScratch> = RefCell::new(I8GemmScratch::new());
-}
 
 fn as_block_slice<T>(data: &[u8]) -> &[T] {
     let size = std::mem::size_of::<T>();
@@ -267,84 +252,10 @@ impl CustomOp1 for QGatedMatMul {
     }
 }
 
-// ---- fbgemm-rs INT8 GEMM (x86_64) ----
+// ---- fbgemm-rs F32 GEMM via pre-packed weights ----
 
-/// Quantize [N, K] row-major F32 weights to [K, N] row-major INT8 (transposed + quantized).
-#[cfg(target_arch = "x86_64")]
-fn quantize_weight_i8(w_f32: &[f32], n: usize, k: usize) -> (Vec<i8>, f32) {
-    let max_abs = w_f32.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
-    let b_scale = max_abs / 127.0;
-    let inv_scale = if b_scale > 0.0 { 1.0 / b_scale } else { 0.0 };
-
-    // Transpose [N, K] → [K, N] while quantizing
-    let mut b_i8 = vec![0i8; k * n];
-    for j in 0..n {
-        for ki in 0..k {
-            let val = w_f32[j * k + ki];
-            b_i8[ki * n + j] = (val * inv_scale).round().clamp(-127.0, 127.0) as i8;
-        }
-    }
-    (b_i8, b_scale)
-}
-
-#[cfg(target_arch = "x86_64")]
-struct I8FbgemmOp {
-    packed: Arc<PackedBMatrixI8>,
-    b_scale: f32,
-}
-
-#[cfg(target_arch = "x86_64")]
-impl CustomOp1 for I8FbgemmOp {
-    fn name(&self) -> &'static str {
-        "i8fbgemm-matmul"
-    }
-
-    fn cpu_fwd(
-        &self,
-        storage: &CpuStorage,
-        layout: &Layout,
-    ) -> Result<(CpuStorage, Shape)> {
-        if !layout.is_contiguous() {
-            candle_core::bail!("input tensor is not contiguous {layout:?}")
-        }
-        let src_shape = layout.shape();
-        let k = self.packed.k();
-        let n = self.packed.n();
-        if src_shape.rank() < 2 {
-            candle_core::bail!("input tensor has only one dimension {layout:?}")
-        }
-        let mut dst_shape = src_shape.dims().to_vec();
-        let last_k = dst_shape.pop().unwrap();
-        if last_k != k {
-            candle_core::bail!(
-                "input tensor {layout:?} incompatible with packed i8 matrix ({k}x{n})"
-            )
-        }
-        dst_shape.push(n);
-        let dst_shape = Shape::from(dst_shape);
-        let m = dst_shape.elem_count() / n;
-
-        if storage.dtype() != DType::F32 {
-            candle_core::bail!("I8FbgemmOp only supports f32 input")
-        }
-        let slice = storage.as_slice::<f32>()?;
-        let slice = &slice[layout.start_offset()..layout.start_offset() + src_shape.elem_count()];
-        let mut dst_storage = vec![0f32; dst_shape.elem_count()];
-
-        I8_SCRATCH.with_borrow_mut(|scratch| {
-            fbgemm_rs::i8gemm_f32_par_with_scratch(m, slice, &self.packed, self.b_scale, &mut dst_storage, scratch);
-        });
-
-        Ok((CpuStorage::F32(dst_storage), dst_shape))
-    }
-}
-
-// ---- fbgemm-rs F32 GEMM (non-x86_64 fallback) ----
-
-#[cfg(not(target_arch = "x86_64"))]
 struct FbgemmOp(Arc<PackedMatrix>);
 
-#[cfg(not(target_arch = "x86_64"))]
 impl CustomOp1 for FbgemmOp {
     fn name(&self) -> &'static str {
         "fbgemm-matmul"
@@ -391,13 +302,10 @@ impl CustomOp1 for FbgemmOp {
 // ---- MatMul: drop-in replacement for QMatMul ----
 
 /// Drop-in replacement for `candle_core::quantized::QMatMul` that uses
-/// column-tiled matmul for quantized weights. Pre-dequantized weights use
-/// INT8 packed GEMM on x86_64, F32 packed GEMM elsewhere.
+/// column-tiled matmul for quantized weights and fbgemm-rs F32 packed
+/// GEMM for pre-dequantized weights.
 pub enum MatMul {
     QTensor(Arc<QTensor>),
-    #[cfg(target_arch = "x86_64")]
-    PackedI8 { packed: Arc<PackedBMatrixI8>, b_scale: f32 },
-    #[cfg(not(target_arch = "x86_64"))]
     Packed(Arc<PackedMatrix>),
 }
 
@@ -405,12 +313,6 @@ impl Clone for MatMul {
     fn clone(&self) -> Self {
         match self {
             Self::QTensor(qt) => Self::QTensor(qt.clone()),
-            #[cfg(target_arch = "x86_64")]
-            Self::PackedI8 { packed, b_scale } => Self::PackedI8 {
-                packed: packed.clone(),
-                b_scale: *b_scale,
-            },
-            #[cfg(not(target_arch = "x86_64"))]
             Self::Packed(p) => Self::Packed(p.clone()),
         }
     }
@@ -420,11 +322,6 @@ impl std::fmt::Debug for MatMul {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
             Self::QTensor(qt) => f.debug_tuple("QTensor").field(qt).finish(),
-            #[cfg(target_arch = "x86_64")]
-            Self::PackedI8 { packed, b_scale } => {
-                write!(f, "PackedI8({}x{}, scale={})", packed.k(), packed.n(), b_scale)
-            }
-            #[cfg(not(target_arch = "x86_64"))]
             Self::Packed(p) => write!(f, "Packed({}x{})", p.k(), p.n()),
         }
     }
@@ -435,27 +332,16 @@ impl MatMul {
         Self::QTensor(qt)
     }
 
-    /// Pack a dequantized [N, K] weight tensor.
-    /// x86_64: quantizes to INT8 and packs for i8gemm.
-    /// Other: packs as F32 for sgemm.
+    /// Pre-pack a dequantized [N, K] weight tensor into fbgemm-rs format.
     pub fn from_tensor(t: Tensor) -> Self {
         let (n, k) = t.dims2().expect("weight must be 2D for MatMul::from_tensor");
-        let w_f32 = t
+        let data = t
             .flatten_all()
             .and_then(|t| t.to_vec1::<f32>())
             .expect("weight to f32");
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            let (b_i8, b_scale) = quantize_weight_i8(&w_f32, n, k);
-            let packed = PackedBMatrixI8::new(k, n, &b_i8);
-            Self::PackedI8 { packed: Arc::new(packed), b_scale }
-        }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
-            let packed = PackedMatrix::from_transposed(k, n, &w_f32);
-            Self::Packed(Arc::new(packed))
-        }
+        // Weight is [N, K] row-major = [K, N] column-major → from_transposed
+        let packed = PackedMatrix::from_transposed(k, n, &data);
+        Self::Packed(Arc::new(packed))
     }
 }
 
@@ -463,14 +349,6 @@ impl Module for MatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
             Self::QTensor(t) => xs.apply_op1_no_bwd(&QTiledOp(t.clone())),
-            #[cfg(target_arch = "x86_64")]
-            Self::PackedI8 { packed, b_scale } => {
-                xs.apply_op1_no_bwd(&I8FbgemmOp {
-                    packed: packed.clone(),
-                    b_scale: *b_scale,
-                })
-            }
-            #[cfg(not(target_arch = "x86_64"))]
             Self::Packed(p) => xs.apply_op1_no_bwd(&FbgemmOp(p.clone())),
         }
     }
