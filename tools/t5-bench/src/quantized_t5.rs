@@ -8,7 +8,7 @@ use candle_transformers::models::t5::{
 #[cfg(not(feature = "hybrid-dequant"))]
 use candle_core::quantized::QMatMul;
 #[cfg(feature = "hybrid-dequant")]
-use crate::fused_matmul::MatMul as QMatMul;
+use warp::fused_matmul::MatMul as QMatMul;
 use candle_transformers::quantized_nn::Embedding;
 use candle_transformers::quantized_var_builder::VarBuilder;
 use serde::Deserialize;
@@ -159,7 +159,7 @@ impl Module for T5DenseGatedActDense {
         #[cfg(feature = "hybrid-dequant")]
         let hidden = match self.act {
             Activation::NewGelu | Activation::GeluPytorchTanh => {
-                crate::fused_matmul::forward_gated_gelu(&self.wi_0, &self.wi_1, xs)?
+                warp::fused_matmul::forward_gated_gelu(&self.wi_0, &self.wi_1, xs)?
             }
             _ => {
                 let hidden_act = self.act.forward(&self.wi_0.forward(xs)?)?;
@@ -215,7 +215,7 @@ impl Module for T5LayerFF {
             None => self.gated_dense_act.as_ref().unwrap().forward(&ys)?,
         };
         #[cfg(feature = "hybrid-dequant")]
-        let xs = crate::fused_matmul::fast_add(xs, &ys)?;
+        let xs = warp::fast_ops::fast_add(xs, &ys)?;
         #[cfg(not(feature = "hybrid-dequant"))]
         let xs = (xs + ys)?;
         Ok(xs)
@@ -343,7 +343,7 @@ impl T5Attention {
         let (scores, position_bias) = match position_bias {
             Some(position_bias) => {
                 #[cfg(feature = "hybrid-dequant")]
-                let scores = crate::fused_matmul::fast_add(&scores, position_bias)?;
+                let scores = warp::fast_ops::fast_add(&scores, position_bias)?;
                 #[cfg(not(feature = "hybrid-dequant"))]
                 let scores = scores.broadcast_add(position_bias)?;
                 (scores, Some(position_bias.clone()))
@@ -394,7 +394,7 @@ impl T5Attention {
                         .unsqueeze(0)?
                         .contiguous()?;
                     #[cfg(feature = "hybrid-dequant")]
-                    let scores = crate::fused_matmul::fast_add(&scores, &position_bias)?;
+                    let scores = warp::fast_ops::fast_add(&scores, &position_bias)?;
                     #[cfg(not(feature = "hybrid-dequant"))]
                     let scores = scores.broadcast_add(&position_bias)?;
                     (scores, Some(position_bias))
@@ -439,7 +439,7 @@ impl T5LayerSelfAttention {
             self.self_attention
                 .forward(&normed_xs, position_bias, None, None)?;
         #[cfg(feature = "hybrid-dequant")]
-        let ys = crate::fused_matmul::fast_add(xs, &ys)?;
+        let ys = warp::fast_ops::fast_add(xs, &ys)?;
         #[cfg(not(feature = "hybrid-dequant"))]
         let ys = (xs + ys)?;
         Ok((ys, position_bias))

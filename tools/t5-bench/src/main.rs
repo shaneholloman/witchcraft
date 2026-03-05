@@ -1,6 +1,4 @@
 mod quantized_t5;
-#[cfg(feature = "hybrid-dequant")]
-mod fused_matmul;
 
 use anyhow::Result;
 use candle_core::{Device, Tensor};
