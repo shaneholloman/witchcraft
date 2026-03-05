@@ -368,7 +368,14 @@ impl Module for MatMul {
             Self::QTensor(t) => xs.apply_op1_no_bwd(&QTiledOp(t.clone())),
             #[cfg(feature = "fbgemm")]
             Self::Packed(p) => xs.apply_op1_no_bwd(&FbgemmOp(p.clone())),
-            Self::Tensor(w) => xs.matmul(&w.t()?),
+            Self::Tensor(w) => {
+                let w = match *xs.dims() {
+                    [b1, b2, _, _] => w.broadcast_left((b1, b2))?.t()?,
+                    [bsize, _, _] => w.broadcast_left(bsize)?.t()?,
+                    _ => w.t()?,
+                };
+                xs.matmul(&w)
+            }
         }
     }
 }
