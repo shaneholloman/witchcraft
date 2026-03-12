@@ -334,15 +334,20 @@ impl MatMul {
     pub fn from_tensor(t: Tensor) -> Self {
         #[cfg(feature = "fbgemm")]
         {
-            let (n, k) = t
-                .dims2()
-                .expect("weight must be 2D for MatMul::from_tensor");
-            let data = t
-                .flatten_all()
-                .and_then(|t| t.to_vec1::<f32>())
-                .expect("weight to f32");
-            let packed = PackedMatrixBf16::from_transposed(k, n, &data);
-            Self::PackedBf16(Arc::new(packed))
+            // fbgemm is CPU-only; fall back to plain tensor for Metal/GPU
+            if matches!(t.device(), candle_core::Device::Cpu) {
+                let (n, k) = t
+                    .dims2()
+                    .expect("weight must be 2D for MatMul::from_tensor");
+                let data = t
+                    .flatten_all()
+                    .and_then(|t| t.to_vec1::<f32>())
+                    .expect("weight to f32");
+                let packed = PackedMatrixBf16::from_transposed(k, n, &data);
+                Self::PackedBf16(Arc::new(packed))
+            } else {
+                Self::Tensor(t)
+            }
         }
         #[cfg(not(feature = "fbgemm"))]
         {
@@ -354,7 +359,16 @@ impl MatMul {
 impl Module for MatMul {
     fn forward(&self, xs: &Tensor) -> Result<Tensor> {
         match self {
-            Self::QTensor(t) => xs.apply_op1_no_bwd(&QTiledOp(t.clone())),
+            Self::QTensor(t) => {
+                // QTiledOp custom op is CPU-only; use candle's QMatMul on Metal
+                if matches!(xs.device(), candle_core::Device::Metal(_)) {
+                    use candle_core::quantized::QMatMul as CandleQMatMul;
+                    let qmm = CandleQMatMul::from_arc(t.clone())?;
+                    qmm.forward(xs)
+                } else {
+                    xs.apply_op1_no_bwd(&QTiledOp(t.clone()))
+                }
+            }
             #[cfg(feature = "fbgemm")]
             Self::PackedBf16(p) => xs.apply_op1_no_bwd(&FbgemmBf16Op(p.clone())),
             Self::Tensor(w) => {
@@ -372,9 +386,19 @@ impl Module for MatMul {
 /// Fused gated-gelu: `gelu(xs @ w0.T) * (xs @ w1.T)`.
 pub fn forward_gated_gelu(w0: &MatMul, w1: &MatMul, xs: &Tensor) -> Result<Tensor> {
     match (w0, w1) {
-        (MatMul::QTensor(w0), MatMul::QTensor(w1)) => {
-            let op = QGatedMatMul(w0.clone(), w1.clone());
-            xs.apply_op1_no_bwd(&op)
+        (MatMul::QTensor(w0_qt), MatMul::QTensor(w1_qt)) => {
+            // QGatedMatMul custom op is CPU-only; fall back to unfused path on Metal
+            if matches!(xs.device(), candle_core::Device::Metal(_)) {
+                use candle_core::quantized::QMatMul as CandleQMatMul;
+                let qmm0 = CandleQMatMul::from_arc(w0_qt.clone())?;
+                let qmm1 = CandleQMatMul::from_arc(w1_qt.clone())?;
+                let gate = qmm0.forward(xs)?.gelu()?;
+                let up = qmm1.forward(xs)?;
+                gate.broadcast_mul(&up)
+            } else {
+                let op = QGatedMatMul(w0_qt.clone(), w1_qt.clone());
+                xs.apply_op1_no_bwd(&op)
+            }
         }
         _ => {
             let gate = w0.forward(xs)?.gelu()?;
