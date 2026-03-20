@@ -143,6 +143,10 @@ impl DB {
         let query =
             "CREATE TABLE IF NOT EXISTS indexed_chunk(chunkid INTEGER PRIMARY KEY NOT NULL)";
         connection.execute(query, ())?;
+
+        let query =
+            "CREATE TABLE IF NOT EXISTS pq_codebook(subspace INTEGER PRIMARY KEY, data BLOB NOT NULL)";
+        connection.execute(query, ())?;
         Ok(Self {
             db_fn,
             connection: Some(connection),
@@ -155,6 +159,7 @@ impl DB {
         self.execute("DELETE FROM chunk")?;
         self.execute("DELETE FROM bucket")?;
         self.execute("DELETE FROM indexed_chunk")?;
+        self.execute("DELETE FROM pq_codebook")?;
         self.execute("VACUUM")?;
         Ok(())
     }
@@ -360,6 +365,22 @@ impl DB {
             (chunkid,),
         )?;
         Ok(())
+    }
+
+    pub fn save_pq_codebook(&self, subspace: u32, data: &[u8]) -> SQLResult<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO pq_codebook VALUES(?1, ?2)",
+            (subspace, data),
+        )?;
+        Ok(())
+    }
+
+    pub fn load_pq_codebooks(&self) -> SQLResult<Vec<(u32, Vec<u8>)>> {
+        let mut stmt = self
+            .conn()
+            .prepare("SELECT subspace, data FROM pq_codebook ORDER BY subspace")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect()
     }
 }
 

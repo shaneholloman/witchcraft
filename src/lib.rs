@@ -65,13 +65,10 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Tensor, D};
 
 const EMBEDDING_DIM: usize = 128;
+const SUB_DIM: usize = EMBEDDING_DIM / 2;
 
-/// Mode for indexing operations - determines which chunks to process
 enum IndexMode {
-    /// Index all chunks (full rebuild)
     Full,
-    /// Index only unindexed chunks (incremental update)
-    Incremental,
 }
 
 pub fn make_device() -> Device {
@@ -323,11 +320,13 @@ fn decompress_keys(bytes: &[u8]) -> Result<Vec<(u32, u32)>> {
 
 fn write_buckets(
     db: &DB,
-    centers: &Tensor,
+    centers_left: &Tensor,
+    centers_right: &Tensor,
+    k_sub: usize,
     device: &Device,
     mode: IndexMode,
     expected_count: u64,
-) -> Result<(Vec<tempfile::NamedTempFile>, Vec<u32>, Tensor)> {
+) -> Result<(Vec<tempfile::NamedTempFile>, Vec<u32>, Tensor, Tensor)> {
     let _priority_mgr = PriorityManager::new();
     let mut mmuls_total = 0;
     let mut writes_total = 0;
@@ -342,12 +341,6 @@ fn write_buckets(
         IndexMode::Full => {
             "SELECT document.rowid,chunk.rowid,chunk.embeddings,chunk.counts FROM document,chunk
             WHERE document.hash = chunk.hash
-            ORDER BY document.rowid"
-        }
-        IndexMode::Incremental => {
-            "SELECT document.rowid,chunk.rowid,chunk.embeddings,chunk.counts FROM document,chunk
-            WHERE document.hash = chunk.hash
-            AND NOT EXISTS (SELECT 1 FROM indexed_chunk WHERE chunkid = chunk.rowid)
             ORDER BY document.rowid"
         }
     };
@@ -366,8 +359,11 @@ fn write_buckets(
     let mut done = false;
     let mut batch = 0;
     let mut tmpfiles = vec![];
-    let centers_cpu = centers.to_device(&Device::Cpu)?;
-    let packed_centers = fast_ops::PackedRight::new(centers)?;
+    let centers_left_cpu = centers_left.to_device(&Device::Cpu)?;
+    let centers_right_cpu = centers_right.to_device(&Device::Cpu)?;
+    let packed_left = fast_ops::PackedRight::new(centers_left)?;
+    let packed_right = fast_ops::PackedRight::new(centers_right)?;
+    let k_sub_u32 = k_sub as u32;
     while !done {
         match results.next() {
             Some(result) => {
@@ -407,17 +403,26 @@ fn write_buckets(
             let indices = document_indices.split_off(left);
             let data = Tensor::cat(&embeddings, 0)?.to_device(device)?;
 
-            // Use batched matmul+argmax to avoid materializing huge intermediate matrix
-            let cluster_assignments =
-                matmul_argmax_batched(&data, &packed_centers, 1024)?.to_device(&Device::Cpu)?;
+            let data_left = data.narrow(1, 0, SUB_DIM)?.contiguous()?;
+            let data_right = data.narrow(1, SUB_DIM, SUB_DIM)?.contiguous()?;
+            let assign_left =
+                matmul_argmax_batched(&data_left, &packed_left, 1024)?.to_device(&Device::Cpu)?;
+            let assign_right =
+                matmul_argmax_batched(&data_right, &packed_right, 1024)?.to_device(&Device::Cpu)?;
+            let assign_left = assign_left.to_vec1::<u32>()?;
+            let assign_right = assign_right.to_vec1::<u32>()?;
+            let combined: Vec<u32> = assign_left
+                .iter()
+                .zip(assign_right.iter())
+                .map(|(&l, &r)| l * k_sub_u32 + r)
+                .collect();
             debug!("simmax took {} ms", now.elapsed().as_millis());
             mmuls_total += now.elapsed().as_millis();
 
             let now = std::time::Instant::now();
             let mut writer = merger::Writer::new()?;
 
-            let mut pairs: Vec<(usize, u32)> = cluster_assignments
-                .to_vec1::<u32>()?
+            let mut pairs: Vec<(usize, u32)> = combined
                 .iter()
                 .enumerate()
                 .map(|(i, &bucket)| (i, bucket))
@@ -454,7 +459,12 @@ fn write_buckets(
                     }
                 }
 
-                let center = centers_cpu.get(bucket as usize)?;
+                let li = (bucket / k_sub_u32) as usize;
+                let ri = (bucket % k_sub_u32) as usize;
+                let center = Tensor::cat(
+                    &[centers_left_cpu.get(li)?, centers_right_cpu.get(ri)?],
+                    0,
+                )?;
                 let residual = (embeddings[sample].get(0) - &center)?;
                 let residual_quantized = residual.compand()?.quantize(4)?.to_q4_bytes()?;
                 residuals_bytes.extend(&residual_quantized);
@@ -471,24 +481,30 @@ fn write_buckets(
     debug!("mmuls took {} ms.", mmuls_total);
     debug!("writes took {} ms.", writes_total);
 
-    Ok((tmpfiles, all_chunkids, centers_cpu))
+    Ok((tmpfiles, all_chunkids, centers_left_cpu, centers_right_cpu))
 }
 
 fn merge_and_write_buckets(
     db: &DB,
     tmpfiles: Vec<tempfile::NamedTempFile>,
     all_chunkids: &[u32],
-    centers_cpu: &Tensor,
-    id_offset: u32,
+    centers_left_cpu: &Tensor,
+    centers_right_cpu: &Tensor,
+    k_sub: usize,
 ) -> Result<()> {
     let mut merger = merger::Merger::from_tempfiles(tmpfiles)?;
     for result in &mut merger {
         let entry = result?;
-        let center = centers_cpu.get(entry.value as usize)?;
+        let li = entry.value as usize / k_sub;
+        let ri = entry.value as usize % k_sub;
+        let center = Tensor::cat(
+            &[centers_left_cpu.get(li)?, centers_right_cpu.get(ri)?],
+            0,
+        )?;
         let center_bytes = center.to_f32_bytes()?;
         let compressed_keys = compress_keys(&entry.keys);
         db.add_bucket(
-            id_offset + entry.value,
+            entry.value,
             &center_bytes,
             &compressed_keys,
             &entry.data,
@@ -618,7 +634,11 @@ pub fn reciprocal_rank_fusion(list1: &[u32], list2: &[u32], k: f64) -> Vec<u32> 
     results
 }
 
-type CentersCache = (Vec<u32>, Vec<usize>, Vec<Tensor>, Tensor);
+struct CentersCache {
+    cluster_ids: Vec<u32>,
+    sizes: Vec<usize>,
+    centers_matrix: Tensor,
+}
 
 static CACHED: Lazy<RwLock<Option<CentersCache>>> = Lazy::new(|| RwLock::new(None));
 
@@ -626,27 +646,25 @@ fn invalidate_center_cache() {
     *CACHED.write().unwrap() = None;
 }
 
-#[allow(clippy::type_complexity)]
-fn get_centers(db: &DB, device: &Device) -> Result<(Vec<u32>, Vec<usize>, Vec<Tensor>, Tensor)> {
+fn get_centers(db: &DB, device: &Device) -> Result<CentersCache> {
     let now = std::time::Instant::now();
     {
         let cache_lock_start = std::time::Instant::now();
         let cache = CACHED.read().unwrap();
         let lock_time = cache_lock_start.elapsed().as_micros();
-        if let Some((cluster_ids, sizes, centers, tensor)) = &*cache {
+        if let Some(c) = &*cache {
             let clone_start = std::time::Instant::now();
-            let result = Ok((
-                cluster_ids.clone(),
-                sizes.clone(),
-                centers.clone(),
-                tensor.clone(),
-            ));
+            let result = CentersCache {
+                cluster_ids: c.cluster_ids.clone(),
+                sizes: c.sizes.clone(),
+                centers_matrix: c.centers_matrix.clone(),
+            };
             debug!(
                 "get_centers cache hit: lock {}μs, clone {}μs",
                 lock_time,
                 clone_start.elapsed().as_micros()
             );
-            return result;
+            return Ok(result);
         }
     }
 
@@ -667,25 +685,31 @@ fn get_centers(db: &DB, device: &Device) -> Result<(Vec<u32>, Vec<usize>, Vec<Te
         let t = Tensor::from_f32_bytes(&center, EMBEDDING_DIM, &Device::Cpu)?.flatten_all()?;
         centers.push(t);
     }
-    let tensor = if !centers.is_empty() {
+    let centers_matrix = if !centers.is_empty() {
         Tensor::stack(&centers, 0)?.to_device(device)?
     } else {
         Tensor::zeros(&[0, EMBEDDING_DIM], DType::F32, device)?
     };
+
     debug!(
-        "reading and stacking centers took {} ms (caching result for future queries.)",
+        "reading centers took {} ms (caching result for future queries.)",
         now.elapsed().as_millis()
     );
 
-    let mut cache = CACHED.write().unwrap();
-    *cache = Some((
-        cluster_ids.clone(),
-        sizes.clone(),
-        centers.clone(),
-        tensor.clone(),
-    ));
+    let result = CentersCache {
+        cluster_ids,
+        sizes,
+        centers_matrix,
+    };
 
-    Ok((cluster_ids, sizes, centers, tensor))
+    let mut cache = CACHED.write().unwrap();
+    *cache = Some(CentersCache {
+        cluster_ids: result.cluster_ids.clone(),
+        sizes: result.sizes.clone(),
+        centers_matrix: result.centers_matrix.clone(),
+    });
+
+    Ok(result)
 }
 
 #[inline(always)]
@@ -731,15 +755,15 @@ pub fn match_centroids(
     let device = query_embeddings.device();
     let (m, _n) = query_embeddings.dims2()?;
 
-    let mut all_residuals = vec![]; // Store residuals, not full embeddings
-    let mut document_clusters = vec![]; // Track which cluster each document belongs to
+    let mut all_residuals = vec![];
+    let mut document_clusters: Vec<u32> = vec![];
     let mut all = vec![];
     let mut count = 0;
     let mut missing = vec![];
-    let mut query_centroid_scores: Vec<Vec<f32>> = vec![]; // Centroid scores for reuse
+    let mut query_centroid_scores: Vec<Vec<f32>> = vec![];
 
     let centers_start = std::time::Instant::now();
-    let (cluster_ids, sizes, centers, centers_matrix) = get_centers(db, device)?;
+    let centers_info = get_centers(db, device)?;
     let centers_time = centers_start.elapsed().as_millis();
 
     debug!(
@@ -749,49 +773,54 @@ pub fn match_centroids(
         setup_start.elapsed().as_millis()
     );
 
-    if !centers.is_empty() {
+    if !centers_info.cluster_ids.is_empty() {
         let now = std::time::Instant::now();
 
-        let query_centroid_similarity = fast_ops::matmul_t(query_embeddings, &centers_matrix)?;
-        let query_centroid_similarity = query_centroid_similarity.to_device(&Device::Cpu)?;
+        let mut topk_bucket_ids: Vec<u32> = Vec::with_capacity(k);
 
-        // Extract centroid scores for later use (m queries × n_clusters)
-        query_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
+        {
+            let query_centroid_similarity =
+                fast_ops::matmul_t(query_embeddings, &centers_info.centers_matrix)?;
+            let query_centroid_similarity =
+                query_centroid_similarity.to_device(&Device::Cpu)?;
 
-        let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
-        let (m, n) = sorted_indices.dims2()?;
+            query_centroid_scores = query_centroid_similarity.to_vec2::<f32>()?;
 
-        let mut topk_clusters = Vec::with_capacity(k);
-        for i in 0..m {
-            let row = sorted_indices.get(i)?;
-            let row_scores_sorted = query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
-            let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
-            let row = row.to_vec1::<u32>()?;
-            let mut cumsum = 0;
-            let mut score = 0.0f32;
-            for j in 0..n.min(k) {
-                let idx = row[j];
-                topk_clusters.push(idx);
-                let size = sizes[idx as usize];
-                if cumsum < t_prime {
-                    score = row_scores_sorted[j];
+            let sorted_indices = query_centroid_similarity.arg_sort_last_dim(false)?;
+            let (m, n) = sorted_indices.dims2()?;
+
+            for i in 0..m {
+                let row = sorted_indices.get(i)?;
+                let row_scores_sorted =
+                    query_centroid_similarity.get(i)?.gather(&row, D::Minus1)?;
+                let row_scores_sorted = row_scores_sorted.to_vec1::<f32>()?;
+                let row = row.to_vec1::<u32>()?;
+                let mut cumsum = 0;
+                let mut score = 0.0f32;
+                for j in 0..n.min(k) {
+                    let idx = row[j];
+                    topk_bucket_ids.push(centers_info.cluster_ids[idx as usize]);
+                    let size = centers_info.sizes[idx as usize];
+                    if cumsum < t_prime {
+                        score = row_scores_sorted[j];
+                    }
+                    cumsum += size;
+
+                    if cumsum >= t_prime {
+                        break;
+                    }
                 }
-                cumsum += size;
-
-                if cumsum >= t_prime {
-                    break;
-                }
+                missing.push(score);
             }
-            missing.push(score);
+            topk_bucket_ids.sort_unstable();
+            topk_bucket_ids.dedup();
+            debug!(
+                "finding {} out of {} clusters took {} ms.",
+                topk_bucket_ids.len(),
+                n,
+                now.elapsed().as_millis()
+            );
         }
-        topk_clusters.sort_unstable();
-        topk_clusters.dedup();
-        debug!(
-            "finding top-{} out of {} clusters took {} ms.",
-            topk_clusters.len(),
-            n,
-            now.elapsed().as_millis()
-        );
 
         let now = std::time::Instant::now();
         let table: [f32; 16] = packops::make_q4_dequant_table()?;
@@ -800,41 +829,39 @@ pub fn match_centroids(
         let mut decompress_time = 0u128;
         let mut dequant_time = 0u128;
 
-        for i in topk_clusters {
+        for &bucket_id in &topk_bucket_ids {
             let db_start = std::time::Instant::now();
-            let (keys_compressed, document_embeddings) = bucket_query
-                .query_row((cluster_ids[i as usize],), |row| {
+            let (keys_compressed, document_embeddings) = match bucket_query
+                .query_row((bucket_id,), |row| {
                     Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
-                })?;
+                }) {
+                Ok(data) => data,
+                Err(e) => {
+                    warn!("bucket {} not found: {}", bucket_id, e);
+                    continue;
+                }
+            };
             db_read_time += db_start.elapsed().as_millis();
 
-            match centers.get(i as usize) {
-                Some(_center) => {
-                    let decompress_start = std::time::Instant::now();
-                    let document_indices = decompress_keys(&keys_compressed)?;
-                    decompress_time += decompress_start.elapsed().as_millis();
+            let decompress_start = std::time::Instant::now();
+            let document_indices = decompress_keys(&keys_compressed)?;
+            decompress_time += decompress_start.elapsed().as_millis();
 
-                    let dequant_start = std::time::Instant::now();
-                    let residuals = Tensor::from_companded_q4_bytes(
-                        &document_embeddings,
-                        EMBEDDING_DIM,
-                        &table,
-                        &Device::Cpu,
-                    )?;
-                    dequant_time += dequant_start.elapsed().as_millis();
+            let dequant_start = std::time::Instant::now();
+            let residuals = Tensor::from_companded_q4_bytes(
+                &document_embeddings,
+                EMBEDDING_DIM,
+                &table,
+                &Device::Cpu,
+            )?;
+            dequant_time += dequant_start.elapsed().as_millis();
 
-                    // Store residuals (not embeddings) and track cluster membership
-                    let (num_docs, _) = residuals.dims2()?;
-                    all_residuals.push(residuals);
-                    for idx in &document_indices[..num_docs] {
-                        document_clusters.push(i as usize); // Track which cluster this doc belongs to
-                        all.push((*idx, count));
-                        count += 1;
-                    }
-                }
-                None => {
-                    warn!("OOB array access i={i}, skipping entry!");
-                }
+            let (num_docs, _) = residuals.dims2()?;
+            all_residuals.push(residuals);
+            for idx in &document_indices[..num_docs] {
+                document_clusters.push(bucket_id);
+                all.push((*idx, count));
+                count += 1;
             }
         }
         debug!(
@@ -924,12 +951,22 @@ pub fn match_centroids(
         let residual_sims = residual_sims.to_dtype(DType::F32)?.contiguous()?;
         let (num_indexed, _) = residual_sims.dims2()?;
 
-        // Add centroid scores to get final similarities for indexed documents
         let mut residual_sims_flat = residual_sims.flatten_all()?.to_vec1::<f32>()?;
-        for (doc_idx, cluster_idx) in document_clusters.iter().enumerate().take(num_indexed) {
-            for (query_idx, centroid_scores) in query_centroid_scores.iter().enumerate().take(n) {
-                let offset = doc_idx * n + query_idx;
-                residual_sims_flat[offset] += centroid_scores[*cluster_idx];
+        let id_to_idx: HashMap<u32, usize> = centers_info
+            .cluster_ids
+            .iter()
+            .enumerate()
+            .map(|(i, &id)| (id, i))
+            .collect();
+        for (doc_idx, &bucket_id) in
+            document_clusters.iter().enumerate().take(num_indexed)
+        {
+            if let Some(&idx) = id_to_idx.get(&bucket_id) {
+                for (qi, centroid_scores) in
+                    query_centroid_scores.iter().enumerate().take(n)
+                {
+                    residual_sims_flat[doc_idx * n + qi] += centroid_scores[idx];
+                }
             }
         }
         sim.extend_from_slice(&residual_sims_flat);
@@ -1390,18 +1427,25 @@ fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(
     Ok((matrix, total_embeddings))
 }
 
-fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<Tensor> {
+fn run_kmeans_for_index(matrix: &Tensor, total_embeddings: usize) -> Result<(Tensor, Tensor, usize)> {
     let now = std::time::Instant::now();
-    let mut k = (16.0 * (total_embeddings as f64).sqrt()).round() as usize;
-    k = k.max(1);
-    debug!("total_embeddings={} k={}", total_embeddings, k);
+    let mut k_sub = (4.0 * (total_embeddings as f64).powf(0.25)).ceil() as usize;
+    k_sub = k_sub.max(2);
     let (m, _) = matrix.dims2()?;
-    if m < k {
-        k = m / 4;
+    if k_sub > m / 2 {
+        k_sub = (m / 2).max(2);
     }
-    let centers = kmeans(matrix, k, 5)?;
-    debug!("kmeans took {} ms.", now.elapsed().as_millis());
-    Ok(centers)
+    debug!(
+        "total_embeddings={} k_sub={} k_eff={}",
+        total_embeddings, k_sub, k_sub * k_sub
+    );
+    let left = matrix.narrow(1, 0, SUB_DIM)?.contiguous()?;
+    let right = matrix.narrow(1, SUB_DIM, SUB_DIM)?.contiguous()?;
+    let scale = 1.0 / (2.0f64).sqrt();
+    let centers_left = (kmeans(&left, k_sub, 5)? * scale)?;
+    let centers_right = (kmeans(&right, k_sub, 5)? * scale)?;
+    debug!("pq kmeans took {} ms.", now.elapsed().as_millis());
+    Ok((centers_left, centers_right, k_sub))
 }
 
 pub fn full_index(db: &DB, device: &Device) -> Result<()> {
@@ -1409,13 +1453,16 @@ pub fn full_index(db: &DB, device: &Device) -> Result<()> {
     let (matrix, total_embeddings) =
         sample_embeddings_for_kmeans(db, "SELECT chunk.embeddings FROM chunk", device)?;
 
-    let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
+    let (centers_left, centers_right, k_sub) =
+        run_kmeans_for_index(&matrix, total_embeddings)?;
 
     debug!("write buckets (full)...");
     let now = std::time::Instant::now();
-    let (tmpfiles, all_chunkids, centers_cpu) = write_buckets(
+    let (tmpfiles, all_chunkids, centers_left_cpu, centers_right_cpu) = write_buckets(
         db,
-        &centers,
+        &centers_left,
+        &centers_right,
+        k_sub,
         device,
         IndexMode::Full,
         total_embeddings as u64,
@@ -1429,7 +1476,15 @@ pub fn full_index(db: &DB, device: &Device) -> Result<()> {
         Ok(()) => {
             db.execute("DELETE FROM bucket")?;
             db.execute("DELETE FROM indexed_chunk")?;
-            merge_and_write_buckets(db, tmpfiles, &all_chunkids, &centers_cpu, 0)?;
+            db.execute("DELETE FROM pq_codebook")?;
+            merge_and_write_buckets(
+                db, tmpfiles, &all_chunkids,
+                &centers_left_cpu, &centers_right_cpu, k_sub,
+            )?;
+            let left_bytes = centers_left_cpu.to_f32_bytes()?;
+            let right_bytes = centers_right_cpu.to_f32_bytes()?;
+            db.save_pq_codebook(0, &left_bytes)?;
+            db.save_pq_codebook(1, &right_bytes)?;
             Ok(())
         }
         Err(v) => {
@@ -1452,54 +1507,7 @@ pub fn full_index(db: &DB, device: &Device) -> Result<()> {
 }
 
 fn incremental_index(db: &DB, device: &Device) -> Result<()> {
-    debug!("read unindexed embeddings for incremental index...");
-    let kmeans_sql = "SELECT c.embeddings FROM chunk AS c
-        WHERE NOT EXISTS (SELECT 1 FROM indexed_chunk AS i WHERE i.chunkid = c.rowid)";
-    let (matrix, total_embeddings) = sample_embeddings_for_kmeans(db, kmeans_sql, device)?;
-
-    let centers = run_kmeans_for_index(&matrix, total_embeddings)?;
-
-    debug!("write buckets (incremental)...");
-    let now = std::time::Instant::now();
-    let (tmpfiles, all_chunkids, centers_cpu) = write_buckets(
-        db,
-        &centers,
-        device,
-        IndexMode::Incremental,
-        total_embeddings as u64,
-    )?;
-    info!(
-        "write buckets (incremental) took {} ms.",
-        now.elapsed().as_millis()
-    );
-
-    let txstatus = match db.begin_transaction() {
-        Ok(()) => {
-            let max_bucket_id: i64 = db
-                .query("SELECT IFNULL(MAX(id), -1) FROM bucket")?
-                .query_row((), |row| row.get(0))?;
-            let id_offset = (max_bucket_id + 1) as u32;
-
-            merge_and_write_buckets(db, tmpfiles, &all_chunkids, &centers_cpu, id_offset)?;
-            Ok(())
-        }
-        Err(v) => {
-            warn!("unable to begin transaction, index not created/updated! {v}");
-            Err(v)
-        }
-    };
-    match txstatus {
-        Ok(()) => {
-            db.commit_transaction()?;
-            invalidate_center_cache();
-            Ok(())
-        }
-        Err(v) => {
-            warn!("failure during indexing transaction {v}");
-            let _ = db.rollback_transaction();
-            Err(v.into())
-        }
-    }
+    full_index(db, device)
 }
 
 pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
@@ -1510,7 +1518,8 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
 
     let indexed = count_indexed_embeddings(db)?;
     let total_buckets = count_buckets(db)?;
-    let expected_k = (16.0 * ((indexed + unindexed) as f64).sqrt()).round() as usize;
+    let k_sub = (4.0 * ((indexed + unindexed) as f64).powf(0.25)).ceil() as usize;
+    let expected_k = k_sub * k_sub;
 
     info!(
         "database has {} unindexed embeddings ({} indexed, {} buckets, ~{} expected)",
