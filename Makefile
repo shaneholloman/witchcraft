@@ -74,6 +74,11 @@ pickbrain: download
 	cargo build --release $(BUILD_TARGET) --features $(PICKBRAIN_FEATURES) --example pickbrain
 	ln -sf target/$(TARGET)/release/examples/pickbrain ./pickbrain
 
+pickbrain-install: pickbrain
+	mkdir -p ~/bin ~/.claude/skills/pickbrain
+	ln -sf $(realpath pickbrain) ~/bin/pickbrain
+	cp skills/pickbrain/SKILL.md ~/.claude/skills/pickbrain/SKILL.md
+
 macintel:
 	RUSTFLAGS='-C target-cpu=haswell' cargo build --release --target x86_64-apple-darwin --features t5-quantized,fbgemm,hybrid-dequant,progress
 
@@ -113,4 +118,4 @@ run: module
 	ln -sf target/release/warp-macos-universal.node warp.node
 	node index.cjs
 
-.PHONY: download build warp-cli pickbrain module win test bench nfcorpus nfcorpus-score run
+.PHONY: download build warp-cli pickbrain pickbrain-install module win test bench nfcorpus nfcorpus-score run
