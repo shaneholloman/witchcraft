@@ -3,7 +3,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use text_splitter::{MarkdownSplitter, TextSplitter};
+use text_splitter::MarkdownSplitter;
 use uuid::Uuid;
 
 use witchcraft::DB;
@@ -254,7 +254,6 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
     }
 
     let session_id = path.file_stem().unwrap().to_string_lossy();
-    let splitter = TextSplitter::new(300);
 
     // Session title: first user message of the entire session
     let session_title: String = chunks
@@ -278,7 +277,9 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
     for (turn_idx, interaction) in interactions.iter().enumerate() {
         // Header line with project and session context
         let header = format!("[{project_name}] {session_title}\n");
+        // One entry per turn so sub_idx maps 1:1 to conversation turns
         let mut all_parts = vec![header];
+        let mut turns_meta: Vec<serde_json::Value> = Vec::new();
 
         for chunk in *interaction {
             let label = if chunk.role == "user" {
@@ -286,9 +287,11 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
             } else {
                 "[Claude]"
             };
-            let line = format!("{label} {}", chunk.text);
-            let parts: Vec<String> = splitter.chunks(&line).map(|c| format!("{c}\n")).collect();
-            all_parts.extend(parts);
+            all_parts.push(format!("{label} {}\n", chunk.text));
+            turns_meta.push(serde_json::json!({
+                "role": chunk.role,
+                "timestamp": chunk.timestamp,
+            }));
         }
 
         let lengths: Vec<usize> = all_parts.iter().map(|p| p.chars().count()).collect();
@@ -309,6 +312,7 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
             "turn": turn_idx,
             "path": path.to_string_lossy(),
             "mtime_ms": mtime_ms,
+            "turns": turns_meta,
         })
         .to_string();
 

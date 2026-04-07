@@ -72,6 +72,8 @@ struct SearchResult {
     source: String,
     bodies: Vec<String>,
     match_idx: usize,
+    match_role: String,
+    match_timestamp: String,
 }
 
 // A turn from the original JSONL session file
@@ -285,6 +287,7 @@ fn run_search(
         .map(|(_score, metadata, bodies, sub_idx, date)| {
             let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
             let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
+            let turn_meta = if idx > 0 { &meta["turns"][idx - 1] } else { &meta["turns"][0] };
             SearchResult {
                 timestamp: format_date(&date),
                 project: meta["project"].as_str().unwrap_or("").to_string(),
@@ -295,6 +298,8 @@ fn run_search(
                 source: meta["source"].as_str().unwrap_or("claude").to_string(),
                 bodies,
                 match_idx: idx,
+                match_role: turn_meta["role"].as_str().unwrap_or("").to_string(),
+                match_timestamp: turn_meta["timestamp"].as_str().unwrap_or("").to_string(),
             }
         })
         .collect();
@@ -417,27 +422,21 @@ fn search_tui(
                     let items: Vec<ratatui::widgets::ListItem> = results
                         .iter()
                         .map(|r| {
-                            let preview_idx = r
-                                .bodies
-                                .iter()
-                                .position(|b| b.starts_with("[User]"))
-                                .or_else(|| {
-                                    if r.match_idx == 0 && r.bodies.len() > 1 {
-                                        Some(1)
-                                    } else {
-                                        Some(r.match_idx)
-                                    }
-                                })
-                                .unwrap_or(0);
+                            let preview_idx = if r.match_idx == 0 && r.bodies.len() > 1 {
+                                1
+                            } else {
+                                r.match_idx
+                            };
                             let raw_preview = first_line(&r.bodies[preview_idx]);
-                            let preview = raw_preview
-                                .strip_prefix("[User] ")
-                                .or_else(|| raw_preview.strip_prefix("[Claude] "))
-                                .or_else(|| raw_preview.strip_prefix("[Codex] "))
-                                .unwrap_or(&raw_preview);
+                            let preview = strip_body_prefix(&raw_preview);
+                            let ts = if !r.match_timestamp.is_empty() {
+                                format_date(&r.match_timestamp)
+                            } else {
+                                r.timestamp.clone()
+                            };
                             let mut meta_spans = vec![
                                 Span::styled(
-                                    format!("{} ", r.timestamp),
+                                    format!("{ts} "),
                                     Style::default().fg(Color::Green),
                                 ),
                                 Span::styled(&r.project, Style::default().fg(Color::Cyan)),
@@ -468,12 +467,26 @@ fn search_tui(
                                     Style::default().fg(Color::DarkGray),
                                 ));
                             }
+                            let role_prefix = if r.match_role == "user" {
+                                "[User] "
+                            } else if r.match_role == "assistant" {
+                                if r.source == "codex" { "[Codex] " } else { "[Claude] " }
+                            } else {
+                                ""
+                            };
                             ratatui::widgets::ListItem::new(vec![
                                 Line::from(meta_spans),
-                                Line::styled(
-                                    format!("  {}", truncate(&preview, width.saturating_sub(4))),
-                                    Style::default(),
-                                ),
+                                Line::from(vec![
+                                    Span::styled(
+                                        format!("  {role_prefix}"),
+                                        Style::default().fg(if r.match_role == "user" {
+                                            Color::Rgb(0, 255, 0)
+                                        } else {
+                                            Color::Cyan
+                                        }),
+                                    ),
+                                    Span::raw(truncate(&preview, width.saturating_sub(4 + role_prefix.len()))),
+                                ]),
                                 Line::from(""),
                             ])
                         })
@@ -516,9 +529,17 @@ fn search_tui(
                         .map(|(_, t)| t.as_slice());
 
                     if let Some(turns) = turns {
-                        let (matched_start, matched_end) =
+                        let (inter_start, inter_end) =
                             interaction_turn_range(turns, r.turn as usize);
+                        // sub_idx 0 = header, 1+ = turn within interaction
+                        let highlighted = if r.match_idx > 0 {
+                            inter_start + r.match_idx - 1
+                        } else {
+                            inter_start
+                        };
                         for (i, turn) in turns.iter().enumerate() {
+                            let is_highlight = i == highlighted;
+                            let in_interaction = i >= inter_start && i < inter_end;
                             let role_style = if turn.role == "user" {
                                 Style::default()
                                     .fg(Color::Rgb(0, 255, 0))
@@ -528,7 +549,13 @@ fn search_tui(
                                     .fg(Color::Cyan)
                                     .add_modifier(Modifier::BOLD)
                             };
-                            let is_matched_turn = i >= matched_start && i < matched_end;
+                            let role_style = if !in_interaction {
+                                Style::default()
+                                    .fg(Color::DarkGray)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                role_style
+                            };
                             lines.push(Line::from(vec![
                                 Span::styled(
                                     if turn.role == "user" {
@@ -545,7 +572,9 @@ fn search_tui(
                                     Style::default().fg(Color::DarkGray),
                                 ),
                             ]));
-                            let text_style = if is_matched_turn {
+                            let text_style = if is_highlight {
+                                Style::default().fg(Color::White)
+                            } else if in_interaction {
                                 Style::default()
                             } else {
                                 Style::default().fg(Color::DarkGray)
@@ -624,12 +653,17 @@ fn search_tui(
                     let r = &results[selected];
                     if !r.session_id.is_empty() && !r.path.is_empty() {
                         let turns = load_session_turns(&r.path, &r.source);
-                        // Scroll to the matched interaction
-                        let (matched_start, _) =
+                        // Scroll to the matched turn
+                        let (inter_start, _) =
                             interaction_turn_range(&turns, r.turn as usize);
+                        let highlighted = if r.match_idx > 0 {
+                            inter_start + r.match_idx - 1
+                        } else {
+                            inter_start
+                        };
                         let mut line_count: u16 = 3; // session header lines
                         for (i, turn) in turns.iter().enumerate() {
-                            if i >= matched_start {
+                            if i >= highlighted {
                                 break;
                             }
                             line_count += 1; // role header
@@ -751,6 +785,13 @@ fn interaction_turn_range(turns: &[SessionTurn], interaction_idx: usize) -> (usi
         .copied()
         .unwrap_or(turns.len());
     (start, end)
+}
+
+fn strip_body_prefix(s: &str) -> &str {
+    s.strip_prefix("[User] ")
+        .or_else(|| s.strip_prefix("[Claude] "))
+        .or_else(|| s.strip_prefix("[Codex] "))
+        .unwrap_or(s)
 }
 
 fn first_line(text: &str) -> String {

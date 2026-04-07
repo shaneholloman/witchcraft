@@ -3,7 +3,7 @@ use regex::Regex;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
-use text_splitter::TextSplitter;
+
 use uuid::Uuid;
 
 use witchcraft::DB;
@@ -189,7 +189,6 @@ fn ingest_session(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize> {
 
     let project_name = cwd.as_deref().map(project_from_cwd).unwrap_or_default();
     let session_id = session_id_from_filename(path);
-    let splitter = TextSplitter::new(300);
 
     let session_title: String = chunks
         .iter()
@@ -211,7 +210,9 @@ fn ingest_session(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize> {
     let mut count = 0;
     for (turn_idx, interaction) in interactions.iter().enumerate() {
         let header = format!("[codex:{project_name}] {session_title}\n");
+        // One entry per turn so sub_idx maps 1:1 to conversation turns
         let mut all_parts = vec![header];
+        let mut turns_meta: Vec<serde_json::Value> = Vec::new();
 
         for chunk in *interaction {
             let label = if chunk.role == "user" {
@@ -219,9 +220,11 @@ fn ingest_session(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize> {
             } else {
                 "[Codex]"
             };
-            let line = format!("{label} {}", chunk.text);
-            let parts: Vec<String> = splitter.chunks(&line).map(|c| format!("{c}\n")).collect();
-            all_parts.extend(parts);
+            all_parts.push(format!("{label} {}\n", chunk.text));
+            turns_meta.push(serde_json::json!({
+                "role": chunk.role,
+                "timestamp": chunk.timestamp,
+            }));
         }
 
         let lengths: Vec<usize> = all_parts.iter().map(|p| p.chars().count()).collect();
@@ -243,6 +246,7 @@ fn ingest_session(db: &mut DB, path: &Path, mtime_ms: i64) -> Result<usize> {
             "path": path.to_string_lossy(),
             "cwd": cwd,
             "mtime_ms": mtime_ms,
+            "turns": turns_meta,
         })
         .to_string();
 
