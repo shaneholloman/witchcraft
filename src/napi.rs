@@ -1,4 +1,4 @@
-/* Node module API for Warp */
+/* Node module API for Witchcraft */
 
 use crate::types::SqlStatement;
 use iso8601_timestamp::Timestamp;
@@ -468,13 +468,13 @@ impl Indexer {
     }
 }
 
-struct WarpInner {
+struct WitchcraftInner {
     db: Option<crate::DB>,
     cache: crate::EmbeddingsCache,
     embedder: Option<crate::Embedder>,
 }
 
-impl WarpInner {
+impl WitchcraftInner {
     pub fn new(db_name: String, assets: String) -> Self {
         let _indexer = Indexer::global(db_name.clone(), assets.clone());
         let db = crate::DB::new_reader(db_name.into()).ok();
@@ -544,15 +544,15 @@ impl WarpInner {
     }
 }
 
-static INNER: OnceLock<Arc<Mutex<WarpInner>>> = OnceLock::new();
-fn inner(db_name: String, assets: String) -> Arc<Mutex<WarpInner>> {
+static INNER: OnceLock<Arc<Mutex<WitchcraftInner>>> = OnceLock::new();
+fn inner(db_name: String, assets: String) -> Arc<Mutex<WitchcraftInner>> {
     INNER
-        .get_or_init(|| Arc::new(Mutex::new(WarpInner::new(db_name, assets))))
+        .get_or_init(|| Arc::new(Mutex::new(WitchcraftInner::new(db_name, assets))))
         .clone()
 }
 
 pub struct SearchTask {
-    inner: Arc<Mutex<WarpInner>>,
+    inner: Arc<Mutex<WitchcraftInner>>,
     q: String,
     threshold: f32,
     top_k: usize,
@@ -589,7 +589,7 @@ impl<'env> ScopedTask<'env> for SearchTask {
 }
 
 pub struct ScoreTask {
-    inner: Arc<Mutex<WarpInner>>,
+    inner: Arc<Mutex<WitchcraftInner>>,
     q: String,
     sentences: Vec<String>,
 }
@@ -613,15 +613,15 @@ impl<'env> ScopedTask<'env> for ScoreTask {
     }
 }
 
-#[napi(js_name = "Warp")]
-pub struct Warp {
+#[napi(js_name = "Witchcraft")]
+pub struct Witchcraft {
     db_name: String,
     assets: String,
     indexer: &'static Indexer,
 }
 
 #[napi]
-impl Warp {
+impl Witchcraft {
     #[napi(constructor)]
     pub fn new(db_name: String, assets: String) -> Self {
         info!("warp running");

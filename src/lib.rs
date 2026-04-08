@@ -1638,7 +1638,7 @@ pub fn search(
     }
 
     debug!(
-        "warp search took {} ms end-to-end.",
+        "witchcraft search took {} ms end-to-end.",
         now.elapsed().as_millis()
     );
     Ok(results)
