@@ -62,8 +62,7 @@ pickbrain finds it, and lets you resume the session directly.
 
 ```
 make pickbrain
-./pickbrain --update              # ingest new/changed sessions
-./pickbrain auth middleware fix    # search across all sessions
+./pickbrain auth middleware fix    # search across all sessions (auto-ingests new sessions)
 ./pickbrain --session <UUID> auth  # search within one session
 ./pickbrain --dump <UUID>          # print full conversation
 ```

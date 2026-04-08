@@ -847,7 +847,6 @@ fn main() -> Result<()> {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(LevelFilter::Warn));
 
     let args: Vec<String> = env::args().skip(1).collect();
-    let do_update = args.iter().any(|a| a == "--update");
     let mut session_filter: Option<String> = None;
     let mut dump_session: Option<String> = None;
     let mut turns_range: Option<String> = None;
@@ -855,7 +854,6 @@ fn main() -> Result<()> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--update" => {}
             "--nuke" => {
                 let db_name = db_path();
                 if db_name.exists() {
@@ -886,37 +884,17 @@ fn main() -> Result<()> {
     let db_name = db_path();
     let assets = assets_path();
 
-    // Always ingest first — cheap filesystem walk with mtime watermarks
-    let has_query = !query_args.is_empty();
-    let has_dump = dump_session.is_some();
-    if has_query || has_dump || do_update {
-        match ingest(&db_name) {
-            Ok(false) => {
-                if do_update && !has_query && !has_dump {
-                    println!("up to date");
-                }
-            }
-            Ok(true) => {
-                if do_update && !has_query {
-                    let device = witchcraft::make_device();
-                    let embedder = Embedder::new(&device, &assets)?;
-                    let db_rw = DB::new(db_name.clone()).unwrap();
-                    embed_and_index(&db_rw, &embedder, &device)?;
-                }
-            }
-            Err(e) => {
-                if !db_name.exists() {
-                    eprintln!("No database found. Run: pickbrain --update");
-                    std::process::exit(1);
-                }
-                eprintln!("warning: ingest failed: {e}");
-            }
+    if let Err(e) = ingest(&db_name) {
+        if !db_name.exists() {
+            eprintln!("No database found. Run: pickbrain <query>");
+            std::process::exit(1);
         }
+        eprintln!("warning: ingest failed: {e}");
     }
 
     if let Some(ref sid) = dump_session {
         dump(&db_name, sid, turns_range.as_deref())?;
-    } else if has_query {
+    } else if !query_args.is_empty() {
         let q = query_args.join(" ");
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
@@ -926,8 +904,8 @@ fn main() -> Result<()> {
         } else {
             search_plain(&db_name, &assets, &q, session_filter.as_deref())?;
         }
-    } else if !do_update {
-        eprintln!("Usage: pickbrain [--update] [--session UUID] <query>");
+    } else {
+        eprintln!("Usage: pickbrain [--session UUID] <query>");
         eprintln!("       pickbrain --dump <UUID> [--turns N-M]");
         eprintln!("       pickbrain --nuke");
     }
