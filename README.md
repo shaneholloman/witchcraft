@@ -5,7 +5,7 @@
 This is a from-scratch reimplementation of Stanford's XTR-Warp semantic search
 engine ( https://github.com/jlscheerer/xtr-warp ) in safe rust, using a
 single-file SQLite database as backing storage, making it suitable for
-client-side deployment. It runs completely stand-alone on your device, needs to
+client-side deployment. It runs completely stand-alone on your device, needs no
 API keys, no vector database, no chunking strategy, no fancy re-rankers, and it
 is lightning fast (21ms p.95 end-to-end search latency on NFCorpus, at 33%
 NDCG@10, on an Apple Macbook Pro M2 Max, more than twice as fast as the
