@@ -1,12 +1,11 @@
 rm -rf output.txt
 
-export RUN="cargo run --bin warp-cli --release --features accelerate,t5-quantized,progress"
+make warp-cli || exit 1
 
-rm -f mydb.sqlite*
-$RUN readcsv datasets/nfcorpus.tsv
-$RUN embed
-$RUN index
+export RUN=./warp-cli
 
+# assumes that "make nfcorpus" has already been run
 $RUN querycsv $HOME/src/xtr-warp/beir/nfcorpus/questions.test.tsv output.txt &&\
 
+echo scoring...
 python score.py output.txt $HOME/src/xtr-warp/beir/nfcorpus/collection_map.json $HOME/src/xtr-warp/beir/nfcorpus/qrels.test.json
