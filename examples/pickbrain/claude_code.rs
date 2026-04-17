@@ -316,6 +316,7 @@ fn ingest_session(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i64) -
         );
 
         let metadata = serde_json::json!({
+            "source": "claude",
             "project": project_name,
             "session_id": session_id.to_string(),
             "turn": turn_idx,
@@ -367,6 +368,7 @@ fn ingest_memory_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: i6
     }
 
     let metadata = serde_json::json!({
+        "source": "claude",
         "project": project_name,
         "path": path.to_string_lossy(),
         "mtime_ms": mtime_ms,
@@ -465,6 +467,7 @@ fn ingest_authored_file(db: &mut DB, path: &Path, project_name: &str, mtime_ms: 
     }
 
     let metadata = serde_json::json!({
+        "source": "claude",
         "project": project_name,
         "path": path_str,
         "mtime_ms": mtime_ms,

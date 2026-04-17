@@ -56,7 +56,7 @@ use progress_reporter::ProgressReporter;
 pub mod types;
 pub use types::SqlStatementInternal;
 
-mod sql_generator;
+pub mod sql_generator;
 use sql_generator::build_filter_sql_and_params;
 
 #[cfg(feature = "napi")]
@@ -1554,6 +1554,9 @@ pub fn search(
     fused.truncate(top_k);
 
     let mut results = vec![];
+    // Stale bucket entries from before a re-chunking may have out-of-range sub_idx
+    // values that clamp to the same position, producing duplicates.
+    let mut seen: HashMap<u32, bool> = HashMap::new();
     let mut body_query = db.query("SELECT metadata,body,lens,date FROM document WHERE rowid = ?1")?;
     for (idx, sub_idx) in fused {
         let tuple : DocPtr = (idx, sub_idx);
@@ -1580,6 +1583,9 @@ pub fn search(
         })?;
 
         let sub = (sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
+        if seen.insert(idx, true).is_some() {
+            continue;
+        }
         results.push((score, metadata, bodies, sub, date));
     }
 
