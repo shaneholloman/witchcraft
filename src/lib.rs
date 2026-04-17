@@ -599,7 +599,6 @@ pub fn fulltext_search(
         }
         fts_matches.push((score2, rowid, i_max as u32));
     }
-    info!("full text found {} matches", fts_matches.len());
     Ok(fts_matches)
 }
 
