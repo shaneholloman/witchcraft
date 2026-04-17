@@ -40,6 +40,13 @@ Search within a specific session:
 pickbrain --session <session-id> "<query>"
 ```
 
+Exclude specific sessions from results (comma-separated or repeated):
+
+```bash
+pickbrain --exclude <uuid1>,<uuid2> "<query>"
+pickbrain --exclude <uuid1> --exclude <uuid2> "<query>"
+```
+
 ## Notes
 
 - First run requires a full ingest+embed pass (~7s). Subsequent searches are incremental.

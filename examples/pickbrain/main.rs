@@ -148,6 +148,7 @@ fn run_search(
     assets: &PathBuf,
     q: &str,
     session: Option<&str>,
+    exclude: &[String],
 ) -> Result<(Vec<SearchResult>, u128)> {
     use witchcraft::types::*;
     let device = witchcraft::make_device();
@@ -155,7 +156,8 @@ fn run_search(
 
     let mut cache = witchcraft::EmbeddingsCache::new(1);
     let db = DB::new_reader(db_name.clone()).unwrap();
-    let sql_filter = session.map(|id| SqlStatementInternal {
+
+    let session_filter = session.map(|id| SqlStatementInternal {
         statement_type: SqlStatementType::Condition,
         condition: Some(SqlConditionInternal {
             key: "$.session_id".to_string(),
@@ -165,6 +167,42 @@ fn run_search(
         logic: None,
         statements: None,
     });
+
+    let exclude_filter = if exclude.is_empty() {
+        None
+    } else {
+        let stmts: Vec<SqlStatementInternal> = exclude
+            .iter()
+            .map(|id| SqlStatementInternal {
+                statement_type: SqlStatementType::Condition,
+                condition: Some(SqlConditionInternal {
+                    key: "$.session_id".to_string(),
+                    operator: SqlOperator::NotEquals,
+                    value: Some(SqlValue::String(id.clone())),
+                }),
+                logic: None,
+                statements: None,
+            })
+            .collect();
+        Some(SqlStatementInternal {
+            statement_type: SqlStatementType::Group,
+            condition: None,
+            logic: Some(SqlLogic::And),
+            statements: Some(stmts),
+        })
+    };
+
+    let sql_filter = match (session_filter, exclude_filter) {
+        (Some(s), Some(e)) => Some(SqlStatementInternal {
+            statement_type: SqlStatementType::Group,
+            condition: None,
+            logic: Some(SqlLogic::And),
+            statements: Some(vec![s, e]),
+        }),
+        (Some(s), None) => Some(s),
+        (None, Some(e)) => Some(e),
+        (None, None) => None,
+    };
     let now = std::time::Instant::now();
     let results = witchcraft::search(
         &db,
@@ -225,8 +263,9 @@ fn search_tui(
     assets: &PathBuf,
     q: &str,
     session: Option<&str>,
+    exclude: &[String],
 ) -> Result<Option<(String, String, String)>> {
-    let (results, search_ms) = run_search(db_name, assets, q, session)?;
+    let (results, search_ms) = run_search(db_name, assets, q, session, exclude)?;
     if results.is_empty() {
         eprintln!("no results");
         return Ok(None);
@@ -683,8 +722,9 @@ fn search_plain(
     assets: &PathBuf,
     q: &str,
     session: Option<&str>,
+    exclude: &[String],
 ) -> Result<()> {
-    let (results, search_ms) = run_search(db_name, assets, q, session)?;
+    let (results, search_ms) = run_search(db_name, assets, q, session, exclude)?;
 
     let mut buf = Vec::new();
     writeln!(buf, "\n[[ {q} ]]")?;
@@ -844,6 +884,7 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = env::args().skip(1).collect();
     let mut session_filter: Option<String> = None;
+    let mut exclude_sessions: Vec<String> = Vec::new();
     let mut dump_session: Option<String> = None;
     let mut turns_range: Option<String> = None;
     let mut query_args: Vec<&str> = Vec::new();
@@ -864,6 +905,16 @@ fn main() -> Result<()> {
             }
             "--session" => {
                 session_filter = iter.next().cloned();
+            }
+            "--exclude" => {
+                if let Some(val) = iter.next() {
+                    for id in val.split(',') {
+                        let id = id.trim();
+                        if !id.is_empty() {
+                            exclude_sessions.push(id.to_string());
+                        }
+                    }
+                }
             }
             "--dump" => {
                 dump_session = iter.next().cloned();
@@ -901,14 +952,14 @@ fn main() -> Result<()> {
         let q = query_args.join(" ");
         use std::io::IsTerminal;
         if std::io::stdout().is_terminal() {
-            if let Some((sid, path, source)) = search_tui(&db_name, &assets, &q, session_filter.as_deref())? {
+            if let Some((sid, path, source)) = search_tui(&db_name, &assets, &q, session_filter.as_deref(), &exclude_sessions)? {
                 launch_resume(&sid, &path, &source)?;
             }
         } else {
-            search_plain(&db_name, &assets, &q, session_filter.as_deref())?;
+            search_plain(&db_name, &assets, &q, session_filter.as_deref(), &exclude_sessions)?;
         }
     } else {
-        eprintln!("Usage: pickbrain [--session UUID] <query>");
+        eprintln!("Usage: pickbrain [--session UUID] [--exclude UUID[,UUID,...]] <query>");
         eprintln!("       pickbrain --dump <UUID> [--turns N-M]");
         eprintln!("       pickbrain --nuke");
     }
