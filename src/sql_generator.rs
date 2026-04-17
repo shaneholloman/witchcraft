@@ -26,31 +26,39 @@ pub fn build_sql_from_statement(
         SqlStatementType::Condition => {
             if let Some(condition) = &statement.condition {
                 let operator = sql_operator_to_string(&condition.operator);
+                // Keys starting with "$." are JSON paths into metadata;
+                // bare names are direct column references (must be simple identifiers).
+                let is_json = condition.key.starts_with("$.");
+                let col_expr = if is_json {
+                    params.push(Box::new(condition.key.clone()));
+                    "json_extract(metadata, ?)".to_string()
+                } else {
+                    if !matches!(condition.key.as_str(), "date" | "uuid") {
+                        return Err(anyhow::anyhow!(
+                            "Invalid column name: {}",
+                            condition.key
+                        ));
+                    }
+                    format!("\"{}\"", condition.key)
+                };
 
                 if matches!(condition.operator, SqlOperator::Exists) {
-                    // EXISTS doesn't need a value parameter
-                    params.push(Box::new(condition.key.clone()));
-                    Ok(format!("json_extract(metadata, ?) {}", operator))
-                } else {
-                    // Regular operators need both key and value
-                    params.push(Box::new(condition.key.clone()));
-
-                    if let Some(value) = &condition.value {
-                        match value {
-                            SqlValue::String(s) => {
-                                params.push(Box::new(s.clone()));
-                            }
-                            SqlValue::Number(n) => {
-                                params.push(Box::new(*n));
-                            }
+                    Ok(format!("{col_expr} {operator}"))
+                } else if let Some(value) = &condition.value {
+                    match value {
+                        SqlValue::String(s) => {
+                            params.push(Box::new(s.clone()));
                         }
-                        Ok(format!("json_extract(metadata, ?) {} ?", operator))
-                    } else {
-                        Err(anyhow::anyhow!(
-                            "Condition with operator {:?} requires a value",
-                            operator
-                        ))
+                        SqlValue::Number(n) => {
+                            params.push(Box::new(*n));
+                        }
                     }
+                    Ok(format!("{col_expr} {operator} ?"))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Condition with operator {:?} requires a value",
+                        operator
+                    ))
                 }
             } else {
                 Err(anyhow::anyhow!("Condition type requires a condition field"))
@@ -343,6 +351,27 @@ mod tests {
             "((json_extract(metadata, ?) = ? OR json_extract(metadata, ?) = ?) AND json_extract(metadata, ?) > ?)"
         );
         assert_eq!(params.len(), 6);
+    }
+
+    #[test]
+    fn test_build_sql_direct_column_reference() {
+        use super::super::types::SqlConditionInternal;
+        let statement = SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "date".to_string(),
+                operator: SqlOperator::GreaterThanOrEquals,
+                value: Some(SqlValue::String("2026-04-17T00:00:00Z".to_string())),
+            }),
+            logic: None,
+            statements: None,
+        };
+
+        let mut params = Vec::new();
+        let sql = build_sql_from_statement(&statement, &mut params).unwrap();
+
+        assert_eq!(sql, "\"date\" >= ?");
+        assert_eq!(params.len(), 1);
     }
 
     #[test]
