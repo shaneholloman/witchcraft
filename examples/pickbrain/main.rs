@@ -38,10 +38,66 @@ fn assets_path() -> PathBuf {
     PathBuf::from(env::var("WARP_ASSETS").unwrap_or_else(|_| "assets".into()))
 }
 
-fn ingest(db_name: &PathBuf) -> Result<bool> {
+/// Walk up the process tree to find the calling Claude Code session ID.
+fn detect_active_session() -> Option<String> {
+    let home = env::var("HOME").ok()?;
+    let sessions_dir = PathBuf::from(&home).join(".claude/sessions");
+    let mut pid = std::process::id() as i32;
+    while pid > 1 {
+        let session_file = sessions_dir.join(format!("{pid}.json"));
+        if let Ok(data) = std::fs::read_to_string(&session_file) {
+            let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+            return v["sessionId"].as_str().map(|s| s.to_string());
+        }
+        pid = get_ppid(pid)?;
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn get_ppid(pid: i32) -> Option<i32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let ret = unsafe {
+        libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0,
+            &mut info as *mut _ as *mut libc::c_void, size)
+    };
+    if ret == size {
+        let ppid = info.pbi_ppid as i32;
+        if ppid > 0 { Some(ppid) } else { None }
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_ppid(pid: i32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // Field 4 (0-indexed: 3) is ppid. Fields 1 is (comm) which may contain spaces,
+    // so skip past the closing paren first.
+    let after_comm = stat.rfind(')')? + 2;
+    let fields: Vec<&str> = stat[after_comm..].split_whitespace().collect();
+    // fields[0] = state, fields[1] = ppid
+    let ppid: i32 = fields.get(1)?.parse().ok()?;
+    if ppid > 0 { Some(ppid) } else { None }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn get_ppid(_pid: i32) -> Option<i32> {
+    None
+}
+
+fn ingest(db_name: &PathBuf, skip_session: Option<&str>, stale_ms: i64) -> Result<bool> {
     let mut db = DB::new(db_name.clone()).unwrap();
-    let (sessions, memories, authored, configs) = claude_code::ingest_claude_code(&mut db)?;
+
+    // Skip the active session only if its source watermark is fresh
+    let claude_skip = skip_session
+        .filter(|_| watermark::is_fresh(&watermark::claude_path(), stale_ms));
+    let (sessions, memories, authored, configs) =
+        claude_code::ingest_claude_code(&mut db, claude_skip)?;
+
     let codex_sessions = codex::ingest_codex(&mut db)?;
+
     let total = sessions + memories + authored + configs + codex_sessions;
     if total == 0 {
         eprintln!("No new sessions to ingest.");
@@ -931,6 +987,8 @@ fn main() -> Result<()> {
     let mut since_ms: Option<i64> = None;
     let mut dump_session: Option<String> = None;
     let mut turns_range: Option<String> = None;
+    let mut current = false;
+    let mut exclude_current = false;
     let mut query_args: Vec<&str> = Vec::new();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -977,6 +1035,12 @@ fn main() -> Result<()> {
             "--turns" => {
                 turns_range = iter.next().cloned();
             }
+            "--current" => {
+                current = true;
+            }
+            "--exclude-current" => {
+                exclude_current = true;
+            }
             _ => {
                 query_args.push(arg);
             }
@@ -1001,7 +1065,31 @@ fn main() -> Result<()> {
         }
     }
 
-    match ingest(&db_name) {
+    // Detect the calling session once — used for both ingest-skip and --current filter.
+    let active_session = detect_active_session();
+
+    if current || exclude_current {
+        match &active_session {
+            Some(id) => {
+                if current {
+                    session_filter = Some(id.clone());
+                }
+                if exclude_current {
+                    exclude_sessions.push(id.clone());
+                }
+            }
+            None => {
+                let flag = if current { "--current" } else { "--exclude-current" };
+                eprintln!("{flag}: could not detect active session");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Skip the active session's JSONL if its watermark is fresh (<10 min).
+    // If we can't detect the active session, nothing is skipped (eager by default).
+    let stale_ms = 10 * 60 * 1000;
+    match ingest(&db_name, active_session.as_deref(), stale_ms) {
         Ok(have_changes) => {
             if have_changes {
                 let db_rw = DB::new(db_name.clone()).unwrap();
@@ -1028,9 +1116,16 @@ fn main() -> Result<()> {
             search_plain(&db_name, &assets, &q, session_filter.as_deref(), &exclude_sessions, since_ms)?;
         }
     } else {
-        eprintln!("Usage: pickbrain [--session UUID] [--exclude UUID,...] [--since 24h|7d|2w] <query>");
+        eprintln!("Usage: pickbrain [options] <query>");
         eprintln!("       pickbrain --dump <UUID> [--turns N-M]");
         eprintln!("       pickbrain --nuke");
+        eprintln!();
+        eprintln!("Options:");
+        eprintln!("  --session UUID       search within a specific session");
+        eprintln!("  --current            search within the calling session");
+        eprintln!("  --exclude UUID,...   exclude sessions from results");
+        eprintln!("  --exclude-current    exclude the calling session");
+        eprintln!("  --since 24h|7d|2w    only search recent history");
     }
     Ok(())
 }

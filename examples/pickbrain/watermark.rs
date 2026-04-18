@@ -35,6 +35,15 @@ pub fn remove(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+pub fn is_fresh(path: &Path, max_age_ms: i64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let wm = mtime_ms(path);
+    wm > 0 && (now - wm) < max_age_ms
+}
+
 pub fn file_newer_than(file: &Path, watermark: i64) -> bool {
     mtime_ms(file) > watermark
 }

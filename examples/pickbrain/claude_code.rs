@@ -544,7 +544,7 @@ fn collect_project_configs(project_dir: &Path) -> Vec<PathBuf> {
 
 use crate::watermark;
 
-pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize, usize)> {
+pub fn ingest_claude_code(db: &mut DB, skip_session: Option<&str>) -> Result<(usize, usize, usize, usize)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let projects_dir = PathBuf::from(&home).join(".claude/projects");
 
@@ -589,6 +589,11 @@ pub fn ingest_claude_code(db: &mut DB) -> Result<(usize, usize, usize, usize)> {
         for jsonl_path in &jsonl_files {
             if !watermark::file_newer_than(jsonl_path, wm_ts) {
                 continue;
+            }
+            if let Some(skip_id) = skip_session {
+                if jsonl_path.file_stem().is_some_and(|s| s == skip_id) {
+                    continue;
+                }
             }
             let mtime_ms = file_mtime_ms(jsonl_path).unwrap_or(0);
             println!("{}", jsonl_path.display());

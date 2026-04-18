@@ -45,13 +45,25 @@ pickbrain --dump <session-id> --turns <start>-<end>
 
 ## Filtering
 
-To search within a specific session:
+To search within the current (calling) session:
+
+```bash
+pickbrain --current "<query>"
+```
+
+To search within a specific session by ID:
 
 ```bash
 pickbrain --session <session-id> "<query>"
 ```
 
-To exclude specific sessions from results (comma-separated or repeated):
+To exclude the current (calling) session from results:
+
+```bash
+pickbrain --exclude-current "<query>"
+```
+
+To exclude specific sessions by ID (comma-separated or repeated):
 
 ```bash
 pickbrain --exclude <uuid1>,<uuid2> "<query>"
@@ -71,3 +83,4 @@ pickbrain --since 2w "<query>"
 - First run requires a full ingest+embed pass (~7s). Subsequent searches auto-ingest incrementally.
 - The database lives at `~/.pickbrain/pickbrain.db`.
 - Results are ranked by semantic similarity — they may not contain the exact query words.
+- The active session's JSONL is skipped during ingest if it was indexed less than 10 minutes ago. If the active session can't be detected (e.g. on Windows), everything is ingested eagerly.
