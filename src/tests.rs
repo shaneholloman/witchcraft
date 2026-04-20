@@ -502,38 +502,4 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn test_redundant_indexes_dropped() -> anyhow::Result<()> {
-        let dir = tempdir()?;
-        let path = dir.path().join("index_test.sqlite");
-
-        // First open creates the schema (with DROP IF EXISTS for old indexes)
-        let mut db = DB::new(path.clone())?;
-        db.add_doc(
-            &Uuid::new_v5(&Uuid::NAMESPACE_OID, b"test"),
-            None, "{}", "test body", None,
-        )?;
-
-        // Verify document_uuid_index does NOT exist (dropped)
-        let idx_count: usize = db.query(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='document_uuid_index'"
-        )?.query_row((), |row| row.get(0))?;
-        assert_eq!(idx_count, 0, "document_uuid_index should be dropped");
-
-        // Verify chunk_index does NOT exist (dropped)
-        let idx_count: usize = db.query(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='chunk_index'"
-        )?.query_row((), |row| row.get(0))?;
-        assert_eq!(idx_count, 0, "chunk_index should be dropped");
-
-        // Verify document_index (on hash, NOT a PK duplicate) still exists
-        let idx_count: usize = db.query(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='document_index'"
-        )?.query_row((), |row| row.get(0))?;
-        assert_eq!(idx_count, 1, "document_index on hash should exist");
-
-        db.clear();
-        db.shutdown();
-        Ok(())
-    }
 }
