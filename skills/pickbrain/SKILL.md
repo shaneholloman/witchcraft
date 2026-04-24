@@ -109,10 +109,11 @@ To show only Slack conversations with unread messages:
 pickbrain --unread "<query>"
 ```
 
-To control the number of results (default 10):
+To control the number of results (0 = unlimited; default: unlimited in TUI, 20 in pipe):
 
 ```bash
-pickbrain -n 20 "<query>"
+pickbrain -n 50 "<query>"
+pickbrain -n 0 "<query>"          # all results
 ```
 
 When any filter is active (`--type`, `--session`, `--channel`, `--dm`, `--no-dm`, `--unread`, `--since`), the query can be omitted to browse matching results sorted by date:

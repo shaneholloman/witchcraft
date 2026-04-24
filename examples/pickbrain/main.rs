@@ -447,19 +447,23 @@ fn run_search(
             statements: Some(filters),
         }),
     };
+    let effective_limit = if num_results == 0 { usize::MAX } else { num_results };
     let now = std::time::Instant::now();
     let results = if q.is_empty() {
         // Filter-only mode: return most recent matching documents
         use witchcraft::sql_generator::build_filter_sql_and_params;
         let (filter_sql, params) = build_filter_sql_and_params(sql_filter.as_ref())?;
         let where_clause = if filter_sql.is_empty() { String::new() } else { format!("WHERE {filter_sql}") };
+        let limit_clause = if num_results == 0 { String::new() } else { " LIMIT ?".to_string() };
         let sql = format!(
-            "SELECT metadata, body, lens, date FROM document {where_clause} ORDER BY date DESC LIMIT ?",
+            "SELECT metadata, body, lens, date FROM document {where_clause} ORDER BY date DESC{limit_clause}",
         );
         let mut stmt = db.query(&sql)?;
         let mut param_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| &**p as &dyn rusqlite::ToSql).collect();
         let limit = num_results as i64;
-        param_refs.push(&limit);
+        if num_results > 0 {
+            param_refs.push(&limit);
+        }
         let rows: Vec<(f32, String, Vec<String>, u32, String)> = stmt
             .query_map(param_refs.as_slice(), |row| {
                 let metadata: String = row.get(0)?;
@@ -481,7 +485,7 @@ fn run_search(
             &mut cache,
             q,
             0.5,
-            num_results,
+            effective_limit,
             true,
             sql_filter.as_ref(),
         )?
@@ -1323,7 +1327,7 @@ fn main() -> Result<()> {
     let mut exclude_sessions: Vec<String> = Vec::new();
     let mut since_ms: Option<i64> = None;
     let mut type_filter: Vec<String> = Vec::new();
-    let mut num_results: usize = 10;
+    let mut num_results: Option<usize> = None;
     let mut dump_session: Option<String> = None;
     let mut turns_range: Option<String> = None;
     let mut dm_only = false;
@@ -1384,7 +1388,7 @@ fn main() -> Result<()> {
             }
             "-n" => {
                 if let Some(val) = iter.next() {
-                    num_results = val.parse().unwrap_or(10);
+                    num_results = Some(val.parse().unwrap_or(0));
                 }
             }
             "--dump" => {
@@ -1483,11 +1487,13 @@ fn main() -> Result<()> {
     } else if !query_args.is_empty() || has_filters {
         let q = query_args.join(" ");
         if std::io::stdout().is_terminal() {
-            if let Some((sid, path, source)) = search_tui(&db_name, &assets, &q, session_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, num_results, dm_only, no_dm, unread_only)? {
+            let n = num_results.unwrap_or(0);
+            if let Some((sid, path, source)) = search_tui(&db_name, &assets, &q, session_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, n, dm_only, no_dm, unread_only)? {
                 launch_resume(&sid, &path, &source)?;
             }
         } else {
-            search_plain(&db_name, &assets, &q, session_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, num_results, dm_only, no_dm, unread_only)?;
+            let n = num_results.unwrap_or(20);
+            search_plain(&db_name, &assets, &q, session_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, n, dm_only, no_dm, unread_only)?;
         }
     } else {
         eprintln!("Usage: pickbrain [options] <query>");
@@ -1501,7 +1507,7 @@ fn main() -> Result<()> {
         eprintln!("  --exclude-current    exclude the calling session");
         eprintln!("  --since 24h|7d|2w    only search recent history");
         eprintln!("  --type claude,slack  filter by source (claude, codex, slack)");
-        eprintln!("  -n N                 number of results (default 10)");
+        eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
         eprintln!("  --dm                 only DMs (Slack)");
         eprintln!("  --no-dm              exclude DMs (Slack)");
         eprintln!("  --unread             only unread conversations (Slack)");
