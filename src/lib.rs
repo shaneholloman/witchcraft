@@ -83,12 +83,19 @@ const LSM_FANOUT: usize = 2;
 pub type DocPtr = (u32, u32);
 
 pub fn make_device() -> Device {
-    // Metal only works on Apple Silicon (ARM), not Intel x86_64
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
         match Device::new_metal(0) {
             Ok(device) => device,
             Err(v) => {
                 warn!("unable to create metal device: {v}");
+                Device::Cpu
+            }
+        }
+    } else if cfg!(feature = "cuda") {
+        match Device::new_cuda(0) {
+            Ok(device) => device,
+            Err(v) => {
+                warn!("unable to create cuda device: {v}");
                 Device::Cpu
             }
         }
