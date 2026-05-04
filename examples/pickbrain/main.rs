@@ -39,6 +39,145 @@ fn assets_path() -> PathBuf {
     PathBuf::from(env::var("WARP_ASSETS").unwrap_or_else(|_| "assets".into()))
 }
 
+struct IngestLock {
+    db: DB,
+}
+
+impl IngestLock {
+    fn try_acquire(db_name: &PathBuf) -> Result<Option<Self>> {
+        let db = DB::new(db_name.clone())?;
+        if db.was_recreated() {
+            reset_ingest_watermarks();
+        }
+
+        Self::ensure_table(&db)?;
+        if Self::insert_lock(&db)? {
+            return Ok(Some(Self { db }));
+        }
+
+        if let Some(pid) = Self::locked_by(&db)? {
+            if !process_is_running(pid) {
+                Self::clear_lock(&db, pid)?;
+                if Self::insert_lock(&db)? {
+                    return Ok(Some(Self { db }));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn ensure_table(db: &DB) -> Result<()> {
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS pickbrain_ingest_lock(
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                pid INTEGER NOT NULL,
+                created_ms INTEGER NOT NULL)",
+        )?;
+        Ok(())
+    }
+
+    fn insert_lock(db: &DB) -> Result<bool> {
+        let pid = std::process::id() as i64;
+        let created_ms = now_ms();
+        let mut stmt = db.query(
+            "INSERT OR IGNORE INTO pickbrain_ingest_lock(id, pid, created_ms)
+             VALUES(1, ?1, ?2)",
+        )?;
+        Ok(stmt.execute((pid, created_ms))? == 1)
+    }
+
+    fn locked_by(db: &DB) -> Result<Option<u32>> {
+        let mut stmt = db.query("SELECT pid FROM pickbrain_ingest_lock WHERE id = 1")?;
+        let mut rows = stmt.query(())?;
+        if let Some(row) = rows.next()? {
+            let pid: i64 = row.get(0)?;
+            if pid > 0 && pid <= u32::MAX as i64 {
+                return Ok(Some(pid as u32));
+            }
+        }
+        Ok(None)
+    }
+
+    fn clear_lock(db: &DB, pid: u32) -> Result<()> {
+        let mut stmt = db.query("DELETE FROM pickbrain_ingest_lock WHERE id = 1 AND pid = ?1")?;
+        stmt.execute((pid as i64,))?;
+        Ok(())
+    }
+}
+
+impl Drop for IngestLock {
+    fn drop(&mut self) {
+        let pid = std::process::id() as i64;
+        if let Ok(mut stmt) =
+            self.db
+                .query("DELETE FROM pickbrain_ingest_lock WHERE id = 1 AND pid = ?1")
+        {
+            let _ = stmt.execute((pid,));
+        }
+    }
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn process_is_running(pid: u32) -> bool {
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn process_is_running(_pid: u32) -> bool {
+    true
+}
+
+fn wants_source(types: &[String], source: &str) -> bool {
+    types.is_empty() || types.iter().any(|t| t == source)
+}
+
+fn needs_ingest(
+    db_name: &PathBuf,
+    skip_session: Option<&str>,
+    stale_ms: i64,
+    types: &[String],
+) -> Result<bool> {
+    if !db_name.exists() {
+        return Ok(true);
+    }
+
+    if wants_source(types, "claude") {
+        let claude_skip = skip_session
+            .filter(|_| watermark::is_fresh(&watermark::claude_path(), stale_ms));
+        if claude_code::has_work(claude_skip)? {
+            return Ok(true);
+        }
+    }
+
+    if wants_source(types, "codex") && codex::has_work() {
+        return Ok(true);
+    }
+
+    if wants_source(types, "slack") && slack::has_work() {
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
+fn warn_lookup_only(reason: impl std::fmt::Display) {
+    eprintln!("warning: ingest needed but {reason}; using lookup-only mode");
+}
+
+fn reset_ingest_watermarks() {
+    watermark::remove(&watermark::claude_path());
+    watermark::remove(&watermark::codex_path());
+    slack::remove_watermark();
+}
+
 /// Walk up the process tree to find the calling Claude Code session ID.
 fn detect_active_session() -> Option<String> {
     let home = env::var("HOME").ok()?;
@@ -94,9 +233,7 @@ fn ingest(db_name: &PathBuf, skip_session: Option<&str>, stale_ms: i64, types: &
     let want = |src: &str| types.is_empty() || types.iter().any(|t| t == src);
 
     if db.was_recreated() {
-        watermark::remove(&watermark::claude_path());
-        watermark::remove(&watermark::codex_path());
-        slack::remove_watermark();
+        reset_ingest_watermarks();
     }
 
     let (sessions, memories, authored, configs) = if want("claude") {
@@ -487,7 +624,16 @@ fn run_search(
 ) -> Result<(Vec<SearchResult>, u128)> {
     let device = witchcraft::make_device();
     let embedder = witchcraft::Embedder::new(&device, assets)?;
-    let db = DB::new_reader(db_name.clone()).unwrap();
+    let db = match DB::new_reader(db_name.clone()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "warning: lookup-only mode could not open {}: {e}",
+                db_name.display()
+            );
+            return Ok((Vec::new(), 0));
+        }
+    };
     let sql_filter = build_sql_filter(session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only);
     let effective_limit = if num_results == 0 { usize::MAX } else { num_results };
     let now = std::time::Instant::now();
@@ -588,7 +734,16 @@ fn search_tui(
 ) -> Result<Option<BranchSession>> {
     let device = witchcraft::make_device();
     let embedder = witchcraft::Embedder::new(&device, assets)?;
-    let db = DB::new_reader(db_name.clone()).unwrap();
+    let db = match DB::new_reader(db_name.clone()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "warning: lookup-only mode could not open {}: {e}",
+                db_name.display()
+            );
+            return Ok(None);
+        }
+    };
     let (mut results, mut search_ms) = match q {
         Some(q) if !q.is_empty() => {
             run_search_with(&db, &embedder, q, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only)?
@@ -1408,7 +1563,16 @@ struct BranchSession {
 
 
 fn find_recent_sessions(db_name: &PathBuf, branch: Option<&str>) -> Result<Vec<SearchResult>> {
-    let db = DB::new_reader(db_name.clone()).unwrap();
+    let db = match DB::new_reader(db_name.clone()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "warning: lookup-only mode could not open {}: {e}",
+                db_name.display()
+            );
+            return Ok(Vec::new());
+        }
+    };
     let sql = if branch.is_some() {
         "SELECT metadata, body, MAX(date) as date
          FROM document
@@ -1507,7 +1671,16 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
     use witchcraft::types::*;
     use witchcraft::sql_generator::build_filter_sql_and_params;
 
-    let db = DB::new_reader(db_name.clone()).unwrap();
+    let db = match DB::new_reader(db_name.clone()) {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!(
+                "warning: lookup-only mode could not open {}: {e}",
+                db_name.display()
+            );
+            return Ok(());
+        }
+    };
     let name = session_id.strip_prefix('#').unwrap_or(session_id);
 
     // Try as session_id first, then thread conv_key, then channel_id/channel_name
@@ -1857,18 +2030,30 @@ fn main() -> Result<()> {
     // Skip the active session's JSONL if its watermark is fresh (<10 min).
     // If we can't detect the active session, nothing is skipped (eager by default).
     let stale_ms = 10 * 60 * 1000;
-    match ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter) {
-        Ok(have_changes) => {
-            if have_changes {
-                let db_rw = DB::new(db_name.clone()).unwrap();
-                let device = witchcraft::make_device();
-                let embedder = witchcraft::Embedder::new(&device, &assets)?;
-                embed_and_index(&db_rw, &embedder, &device)?;
+    if needs_ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter)? {
+        match IngestLock::try_acquire(&db_name) {
+            Ok(Some(_lock)) => {
+                match ingest(&db_name, active_session.as_deref(), stale_ms, &type_filter) {
+                    Ok(have_changes) => {
+                        if have_changes {
+                            let db_rw = DB::new(db_name.clone()).unwrap();
+                            let device = witchcraft::make_device();
+                            let embedder = witchcraft::Embedder::new(&device, &assets)?;
+                            embed_and_index(&db_rw, &embedder, &device)?;
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("warning: ingest failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            },
+            Ok(None) => {
+                warn_lookup_only("another pickbrain process is ingesting");
             }
-        },
-        Err(e) => {
-            eprintln!("warning: ingest failed: {e}");
-            std::process::exit(1);
+            Err(e) => {
+                warn_lookup_only(format!("the ingest lock could not be acquired: {e}"));
+            }
         }
     }
 

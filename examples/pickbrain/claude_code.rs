@@ -593,6 +593,76 @@ fn collect_project_configs(project_dir: &Path) -> Vec<PathBuf> {
 
 use crate::watermark;
 
+pub fn has_work(skip_session: Option<&str>) -> Result<bool> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let projects_dir = PathBuf::from(&home).join(".claude/projects");
+
+    if !projects_dir.is_dir() {
+        return Ok(false);
+    }
+
+    let wm_ts = watermark::mtime_ms(&watermark::claude_path());
+
+    let mut entries: Vec<_> = fs::read_dir(&projects_dir)?
+        .filter_map(|e| e.ok())
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let dir_path = entry.path();
+        if !dir_path.is_dir() {
+            continue;
+        }
+
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        let project_name = decode_project_name(&dir_name);
+
+        let mut jsonl_files: Vec<PathBuf> = fs::read_dir(&dir_path)?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+            .collect();
+        jsonl_files.sort();
+
+        for jsonl_path in &jsonl_files {
+            if !watermark::file_newer_than(jsonl_path, wm_ts) {
+                continue;
+            }
+            if let Some(skip_id) = skip_session {
+                if jsonl_path.file_stem().is_some_and(|s| s == skip_id) {
+                    continue;
+                }
+            }
+            return Ok(true);
+        }
+
+        let memory_dir = dir_path.join("memory");
+        if memory_dir.is_dir() {
+            let mut md_files: Vec<PathBuf> = fs::read_dir(&memory_dir)?
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
+                .collect();
+            md_files.sort();
+
+            for md_path in &md_files {
+                if watermark::file_newer_than(md_path, wm_ts) {
+                    return Ok(true);
+                }
+            }
+        }
+
+        let real_project_dir = PathBuf::from("/").join(&project_name);
+        for config_path in collect_project_configs(&real_project_dir) {
+            if watermark::file_newer_than(&config_path, wm_ts) {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 pub fn ingest_claude_code(db: &mut DB, skip_session: Option<&str>) -> Result<(usize, usize, usize, usize)> {
     let home = std::env::var("HOME").unwrap_or_default();
     let projects_dir = PathBuf::from(&home).join(".claude/projects");

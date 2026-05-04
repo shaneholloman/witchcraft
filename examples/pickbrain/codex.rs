@@ -409,6 +409,19 @@ pub fn ingest_codex(db: &mut DB) -> Result<usize> {
     Ok(session_count)
 }
 
+pub fn has_work() -> bool {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let sessions_dir = PathBuf::from(&home).join(".codex/sessions");
+    if !sessions_dir.is_dir() {
+        return false;
+    }
+
+    let wm_ts = watermark::mtime_ms(&watermark::codex_path());
+    collect_session_files(&sessions_dir)
+        .iter()
+        .any(|path| watermark::file_newer_than(path, wm_ts))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

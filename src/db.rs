@@ -3,7 +3,7 @@ use iso8601_timestamp::Timestamp;
 use log::{error, warn};
 use rusqlite::{params_from_iter, Connection, OpenFlags, Result as SQLResult, Statement};
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::sql_generator::build_filter_sql_and_params;
@@ -17,6 +17,7 @@ pub struct DB {
     connection: Option<Connection>,
     remove_on_shutdown: bool,
     recreated: bool,
+    read_only: bool,
 }
 
 impl DB {
@@ -30,6 +31,17 @@ impl DB {
 
     pub fn path(&self) -> &PathBuf {
         &self.db_fn
+    }
+
+    fn sidecar_path(db_fn: &Path, suffix: &str) -> PathBuf {
+        let mut path = db_fn.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    }
+
+    fn remove_sidecars(db_fn: &Path) {
+        let _ = std::fs::remove_file(Self::sidecar_path(db_fn, "-wal"));
+        let _ = std::fs::remove_file(Self::sidecar_path(db_fn, "-shm"));
     }
 
     fn configure(connection: &Connection) -> SQLResult<()> {
@@ -135,6 +147,7 @@ impl DB {
             connection: Some(connection),
             remove_on_shutdown: false,
             recreated: false,
+            read_only: true,
         })
     }
 
@@ -162,8 +175,7 @@ impl DB {
             connection.close().map_err(|(_conn, e)| e)?;
             std::fs::remove_file(&db_fn)
                 .map_err(|_e| rusqlite::Error::InvalidPath(db_fn.clone()))?;
-            let _ = std::fs::remove_file(db_fn.with_extension("wal"));
-            let _ = std::fs::remove_file(db_fn.with_extension("shm"));
+            Self::remove_sidecars(&db_fn);
             connection = Connection::open(&db_fn)?;
             first_creation = true;
         }
@@ -179,6 +191,7 @@ impl DB {
             connection: Some(connection),
             remove_on_shutdown: false,
             recreated,
+            read_only: false,
         })
     }
 
@@ -238,7 +251,9 @@ impl DB {
         if let Some(connection) = self.connection.take() {
             // Checkpoint and truncate the WAL file so the main .sqlite file is
             // self-contained on exit (no stale -wal / -shm files left behind).
-            Self::checkpoint_internal(&connection, false);
+            if !self.read_only {
+                Self::checkpoint_internal(&connection, false);
+            }
             match connection.close() {
                 Ok(_) => {}
                 Err((conn, e)) => {
@@ -263,16 +278,17 @@ impl DB {
             };
 
             // Also remove WAL and SHM files if they exist
-            let _ = std::fs::remove_file(self.db_fn.with_extension("wal"));
-            let _ = std::fs::remove_file(self.db_fn.with_extension("shm"));
+            Self::remove_sidecars(&self.db_fn);
         }
     }
 
     /// Checkpoint and truncate the WAL into the main database file.
     /// Safe to call at any point when no statements are active on this connection.
     pub fn checkpoint(&self) {
-        if let Some(connection) = self.connection.as_ref() {
-            Self::checkpoint_internal(connection, true);
+        if !self.read_only {
+            if let Some(connection) = self.connection.as_ref() {
+                Self::checkpoint_internal(connection, true);
+            }
         }
     }
 
@@ -431,7 +447,9 @@ impl DB {
 impl Drop for DB {
     fn drop(&mut self) {
         if let Some(connection) = self.connection.take() {
-            Self::checkpoint_internal(&connection, false);
+            if !self.read_only {
+                Self::checkpoint_internal(&connection, false);
+            }
             match connection.close() {
                 Ok(_) => {}
                 Err((conn, e)) => {

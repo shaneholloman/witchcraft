@@ -769,6 +769,14 @@ pub fn ingest_slack(db: &mut DB) -> Result<usize> {
     Ok(count)
 }
 
+pub fn has_work() -> bool {
+    let Some(blob_dir) = find_slack_blob_dir() else {
+        return false;
+    };
+    let current_mtime = blob_dir_mtime(&blob_dir);
+    current_mtime > 0 && current_mtime > read_watermark()
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
