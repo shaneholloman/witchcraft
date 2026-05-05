@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use openvino::{CompiledModel, Core, DeviceType, InferRequest, Shape};
-use rand::Rng;
+use rand::RngExt;
 use std::path::PathBuf;
 use std::time::Instant;
 

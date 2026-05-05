@@ -16,7 +16,7 @@ serde = "*"
 serde_json = "*"
 
 # OpenVINO support (optional)
-openvino = { version = "0.9.1", features = ["runtime-linking"], optional = true }
+openvino = { version = "0.10.0", features = ["runtime-linking"], optional = true }
 tempfile = "*"
 
 # Warp with hybrid-dequant for comparison (fbgemm feature adds fbgemm-rs packed GEMM)

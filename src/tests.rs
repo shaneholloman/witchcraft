@@ -388,12 +388,12 @@ mod tests {
         crate::index_chunks(&db, &device).unwrap();
 
         // Verify generations span multiple levels
-        let levels: Vec<(u32, usize)> = {
+        let levels: Vec<(u32, i64)> = {
             let mut level_query = db
                 .query("SELECT level, SUM(num_embeddings) FROM generation GROUP BY level ORDER BY level")
                 .unwrap();
             level_query
-                .query_map((), |row| Ok((row.get::<_, u32>(0)?, row.get::<_, usize>(1)?)))
+                .query_map((), |row| Ok((row.get::<_, u32>(0)?, row.get::<_, i64>(1)?)))
                 .unwrap()
                 .map(Result::unwrap)
                 .collect()
@@ -567,21 +567,21 @@ mod tests {
         assert_eq!(count, 3);
 
         // Verify docs exist
-        let row_count: usize = db.query("SELECT COUNT(*) FROM document")?
+        let row_count: i64 = db.query("SELECT COUNT(*) FROM document")?
             .query_row((), |row| row.get(0))?;
         assert_eq!(row_count, 3);
 
         // Verify add_doc delegates to add_docs_batch correctly
         let uuid4 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc4");
         db.add_doc(&uuid4, None, r#"{"title":"four"}"#, "fourth body", None)?;
-        let row_count: usize = db.query("SELECT COUNT(*) FROM document")?
+        let row_count: i64 = db.query("SELECT COUNT(*) FROM document")?
             .query_row((), |row| row.get(0))?;
         assert_eq!(row_count, 4);
 
         // Verify upsert: re-add doc1 with different body
         let uuid1 = Uuid::new_v5(&Uuid::NAMESPACE_OID, b"doc1");
         db.add_doc(&uuid1, None, r#"{"title":"one-updated"}"#, "updated body", None)?;
-        let row_count: usize = db.query("SELECT COUNT(*) FROM document")?
+        let row_count: i64 = db.query("SELECT COUNT(*) FROM document")?
             .query_row((), |row| row.get(0))?;
         assert_eq!(row_count, 4); // still 4, not 5
 
@@ -708,7 +708,7 @@ mod tests {
         assert_eq!(count, 1, "only the non-empty doc should be embedded");
 
         // Verify the chunk table has exactly one entry
-        let chunk_count: usize = db.query("SELECT COUNT(*) FROM chunk")?
+        let chunk_count: i64 = db.query("SELECT COUNT(*) FROM chunk")?
             .query_row((), |row| row.get(0))?;
         assert_eq!(chunk_count, 1);
 

@@ -372,7 +372,11 @@ impl DB {
             let mut hasher = Sha256::new();
             hasher.update(body.as_bytes());
             hasher.update(lens_str.as_bytes());
-            let hash = format!("{:x}", hasher.finalize());
+            let hash: String = hasher
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
             let hash = &hash[..HASH_CHARS];
 
             let date = date.unwrap_or_else(Timestamp::now_utc);

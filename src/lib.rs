@@ -528,7 +528,7 @@ fn get_all_generation_centers(db: &DB, device: &Device) -> Result<Vec<Generation
         let mut centers = vec![];
         for result in center_query.query_map((RESIDUAL_BYTES as i64, gen_id), |row| {
             let id = row.get(0)?;
-            let size = row.get(1)?;
+            let size = row.get::<_, i64>(1)? as usize;
             let blob: Vec<u8> = row.get(2)?;
             Ok((id, size, blob))
         })? {
@@ -1057,7 +1057,8 @@ pub fn embed_chunks(db: &DB, embedder: &Embedder, limit: Option<usize>) -> Resul
             }
         );
         let mut count_query = db.query(&count_sql)?;
-        let total: usize = count_query.query_row((), |row| row.get::<_, usize>(0))?;
+        let total: i64 = count_query.query_row((), |row| row.get(0))?;
+        let total: usize = total.try_into()?;
         ProgressReporter::new("embed", total)
     };
 
@@ -1157,12 +1158,12 @@ fn count_chunk_embeddings(db: &DB) -> Result<usize> {
 }
 
 fn count_indexed_embeddings(db: &DB) -> Result<usize> {
-    let count: usize = db
+    let count: i64 = db
         .query(&format!(
             "SELECT IFNULL(SUM(length(residuals)/{RESIDUAL_BYTES}), 0) FROM bucket"
         ))?
-        .query_row((), |row| row.get::<_, usize>(0))?;
-    Ok(count)
+        .query_row((), |row| row.get(0))?;
+    Ok(count.try_into()?)
 }
 
 fn sample_embeddings_for_kmeans(db: &DB, sql: &str, device: &Device) -> Result<(Tensor, usize)> {
@@ -1430,7 +1431,10 @@ pub fn index_chunks(db: &DB, device: &Device) -> Result<()> {
                 "SELECT IFNULL(SUM(num_embeddings), 0) FROM generation WHERE level = {}",
                 target_level
             ))?
-            .query_row((), |row| row.get::<_, usize>(0))?;
+            .query_row((), |row| {
+                let level_size: i64 = row.get(0)?;
+                Ok(level_size as usize)
+            })?;
         total += level_size;
         if total <= cap {
             break;
