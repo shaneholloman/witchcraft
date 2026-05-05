@@ -140,6 +140,7 @@ fn embed_and_index(db: &DB, embedder: &Embedder, device: &candle_core::Device) -
 
 // --- Search result data ---
 
+#[derive(Clone)]
 struct TurnMeta {
     role: String,
     timestamp: String,
@@ -147,14 +148,17 @@ struct TurnMeta {
     byte_len: u64,
 }
 
+#[derive(Clone)]
 struct SearchResult {
     timestamp: String,
     project: String,
     session_id: String,
+    session_name: String,
     turn: u64,
     path: String,
     cwd: String,
     source: String,
+    branch: String,
     conv_key: String,
     bodies: Vec<String>,
     match_idx: usize,
@@ -237,33 +241,23 @@ fn parse_since(s: &str) -> Option<i64> {
     Some(n * ms_per_unit)
 }
 
-fn run_search(
-    db_name: &PathBuf,
-    assets: &PathBuf,
-    q: &str,
+fn build_sql_filter(
     session: Option<&str>,
+    branch: Option<&str>,
     exclude: &[String],
     since_ms: Option<i64>,
     types: &[String],
-    num_results: usize,
     dm_only: bool,
     no_dm: bool,
     unread_only: bool,
-) -> Result<(Vec<SearchResult>, u128)> {
+) -> Option<witchcraft::types::SqlStatementInternal> {
     use witchcraft::types::*;
-    let device = witchcraft::make_device();
-    let embedder = witchcraft::Embedder::new(&device, assets)?;
-
-    let mut cache = witchcraft::EmbeddingsCache::new(1);
-    let db = DB::new_reader(db_name.clone()).unwrap();
-
-    let session_filter = session.map(|id| {
+    let mut conditions: Vec<SqlStatementInternal> = Vec::new();
+    if let Some(id) = session {
         let name = id.strip_prefix('#').unwrap_or(id);
-        // For thread references like "thr:1234.5678", extract just the TS part.
         let thread_ts = name.strip_prefix("thr:").unwrap_or(name);
         let thread_like = format!("%-{thread_ts}");
-        // Match session_id (Claude/Codex), channel_id, channel_name, or conv_key thread TS (Slack)
-        SqlStatementInternal {
+        conditions.push(SqlStatementInternal {
             statement_type: SqlStatementType::Group,
             condition: None,
             logic: Some(SqlLogic::Or),
@@ -309,34 +303,33 @@ fn run_search(
                     statements: None,
                 },
             ]),
-        }
-    });
-
-    let exclude_filter = if exclude.is_empty() {
-        None
-    } else {
-        let stmts: Vec<SqlStatementInternal> = exclude
-            .iter()
-            .map(|id| SqlStatementInternal {
-                statement_type: SqlStatementType::Condition,
-                condition: Some(SqlConditionInternal {
-                    key: "$.session_id".to_string(),
-                    operator: SqlOperator::NotEquals,
-                    value: Some(SqlValue::String(id.clone())),
-                }),
-                logic: None,
-                statements: None,
-            })
-            .collect();
-        Some(SqlStatementInternal {
-            statement_type: SqlStatementType::Group,
-            condition: None,
-            logic: Some(SqlLogic::And),
-            statements: Some(stmts),
-        })
-    };
-
-    let since_filter = since_ms.map(|ms| {
+        });
+    }
+    if let Some(br) = branch {
+        conditions.push(SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.branch".to_string(),
+                operator: SqlOperator::Equals,
+                value: Some(SqlValue::String(br.to_string())),
+            }),
+            logic: None,
+            statements: None,
+        });
+    }
+    for id in exclude {
+        conditions.push(SqlStatementInternal {
+            statement_type: SqlStatementType::Condition,
+            condition: Some(SqlConditionInternal {
+                key: "$.session_id".to_string(),
+                operator: SqlOperator::NotEquals,
+                value: Some(SqlValue::String(id.clone())),
+            }),
+            logic: None,
+            statements: None,
+        });
+    }
+    if let Some(ms) = since_ms {
         let cutoff_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -344,7 +337,7 @@ fn run_search(
             - ms / 1000;
         let cutoff_dt = chrono::DateTime::from_timestamp(cutoff_secs, 0).unwrap();
         let cutoff_iso = cutoff_dt.to_rfc3339();
-        SqlStatementInternal {
+        conditions.push(SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
             condition: Some(SqlConditionInternal {
                 key: "date".to_string(),
@@ -353,46 +346,44 @@ fn run_search(
             }),
             logic: None,
             statements: None,
-        }
-    });
-
-    let type_filter = if types.is_empty() {
-        None
-    } else if types.len() == 1 {
-        Some(SqlStatementInternal {
-            statement_type: SqlStatementType::Condition,
-            condition: Some(SqlConditionInternal {
-                key: "$.source".to_string(),
-                operator: SqlOperator::Equals,
-                value: Some(SqlValue::String(types[0].clone())),
-            }),
-            logic: None,
-            statements: None,
-        })
-    } else {
-        let stmts: Vec<SqlStatementInternal> = types
-            .iter()
-            .map(|t| SqlStatementInternal {
+        });
+    }
+    if !types.is_empty() {
+        if types.len() == 1 {
+            conditions.push(SqlStatementInternal {
                 statement_type: SqlStatementType::Condition,
                 condition: Some(SqlConditionInternal {
                     key: "$.source".to_string(),
                     operator: SqlOperator::Equals,
-                    value: Some(SqlValue::String(t.clone())),
+                    value: Some(SqlValue::String(types[0].clone())),
                 }),
                 logic: None,
                 statements: None,
-            })
-            .collect();
-        Some(SqlStatementInternal {
-            statement_type: SqlStatementType::Group,
-            condition: None,
-            logic: Some(SqlLogic::Or),
-            statements: Some(stmts),
-        })
-    };
-
-    let dm_filter = if dm_only {
-        Some(SqlStatementInternal {
+            });
+        } else {
+            let stmts: Vec<SqlStatementInternal> = types
+                .iter()
+                .map(|t| SqlStatementInternal {
+                    statement_type: SqlStatementType::Condition,
+                    condition: Some(SqlConditionInternal {
+                        key: "$.source".to_string(),
+                        operator: SqlOperator::Equals,
+                        value: Some(SqlValue::String(t.clone())),
+                    }),
+                    logic: None,
+                    statements: None,
+                })
+                .collect();
+            conditions.push(SqlStatementInternal {
+                statement_type: SqlStatementType::Group,
+                condition: None,
+                logic: Some(SqlLogic::Or),
+                statements: Some(stmts),
+            });
+        }
+    }
+    if dm_only {
+        conditions.push(SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
             condition: Some(SqlConditionInternal {
                 key: "$.is_dm".to_string(),
@@ -401,9 +392,9 @@ fn run_search(
             }),
             logic: None,
             statements: None,
-        })
+        });
     } else if no_dm {
-        Some(SqlStatementInternal {
+        conditions.push(SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
             condition: Some(SqlConditionInternal {
                 key: "$.is_dm".to_string(),
@@ -412,13 +403,10 @@ fn run_search(
             }),
             logic: None,
             statements: None,
-        })
-    } else {
-        None
-    };
-
-    let unread_filter = if unread_only {
-        Some(SqlStatementInternal {
+        });
+    }
+    if unread_only {
+        conditions.push(SqlStatementInternal {
             statement_type: SqlStatementType::Condition,
             condition: Some(SqlConditionInternal {
                 key: "$.has_unread".to_string(),
@@ -427,30 +415,83 @@ fn run_search(
             }),
             logic: None,
             statements: None,
-        })
-    } else {
+        });
+    }
+    if conditions.is_empty() {
         None
-    };
-
-    let filters: Vec<SqlStatementInternal> = [session_filter, exclude_filter, since_filter, type_filter, dm_filter, unread_filter]
-        .into_iter()
-        .flatten()
-        .collect();
-
-    let sql_filter = match filters.len() {
-        0 => None,
-        1 => Some(filters.into_iter().next().unwrap()),
-        _ => Some(SqlStatementInternal {
+    } else if conditions.len() == 1 {
+        Some(conditions.remove(0))
+    } else {
+        Some(SqlStatementInternal {
             statement_type: SqlStatementType::Group,
             condition: None,
             logic: Some(SqlLogic::And),
-            statements: Some(filters),
-        }),
-    };
+            statements: Some(conditions),
+        })
+    }
+}
+
+fn parse_search_results(
+    results: Vec<(f32, String, Vec<String>, u32, String)>,
+) -> Vec<SearchResult> {
+    results
+        .into_iter()
+        .map(|(_score, metadata, bodies, sub_idx, date)| {
+            let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
+            let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
+            let turns_arr: Vec<TurnMeta> = meta["turns"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .map(|v| TurnMeta {
+                            role: v["role"].as_str().unwrap_or("").to_string(),
+                            timestamp: v["timestamp"].as_str().unwrap_or("").to_string(),
+                            byte_offset: v["off"].as_u64().unwrap_or(0),
+                            byte_len: v["len"].as_u64().unwrap_or(0),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            SearchResult {
+                timestamp: format_date(&date),
+                project: meta["project"].as_str().unwrap_or("").to_string(),
+                session_id: meta["session_id"].as_str().unwrap_or("").to_string(),
+                session_name: meta["session_name"].as_str().unwrap_or("").to_string(),
+                turn: meta["turn"].as_u64().unwrap_or(0),
+                path: meta["path"].as_str().unwrap_or("").to_string(),
+                cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
+                source: meta["source"].as_str().unwrap_or("claude").to_string(),
+                branch: meta["branch"].as_str().unwrap_or("").to_string(),
+                conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
+                bodies,
+                match_idx: idx,
+                turns: turns_arr,
+            }
+        })
+        .collect()
+}
+
+fn run_search(
+    db_name: &PathBuf,
+    assets: &PathBuf,
+    q: &str,
+    session: Option<&str>,
+    branch: Option<&str>,
+    exclude: &[String],
+    since_ms: Option<i64>,
+    types: &[String],
+    num_results: usize,
+    dm_only: bool,
+    no_dm: bool,
+    unread_only: bool,
+) -> Result<(Vec<SearchResult>, u128)> {
+    let device = witchcraft::make_device();
+    let embedder = witchcraft::Embedder::new(&device, assets)?;
+    let db = DB::new_reader(db_name.clone()).unwrap();
+    let sql_filter = build_sql_filter(session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only);
     let effective_limit = if num_results == 0 { usize::MAX } else { num_results };
     let now = std::time::Instant::now();
     let results = if q.is_empty() {
-        // Filter-only mode: return most recent matching documents
         use witchcraft::sql_generator::build_filter_sql_and_params;
         let (filter_sql, params) = build_filter_sql_and_params(sql_filter.as_ref())?;
         let where_clause = if filter_sql.is_empty() { String::new() } else { format!("WHERE {filter_sql}") };
@@ -482,7 +523,7 @@ fn run_search(
         witchcraft::search(
             &db,
             &embedder,
-            &mut cache,
+            &mut witchcraft::EmbeddingsCache::new(1),
             q,
             0.5,
             effective_limit,
@@ -491,41 +532,37 @@ fn run_search(
         )?
     };
     let search_ms = now.elapsed().as_millis();
+    Ok((parse_search_results(results), search_ms))
+}
 
-    let out: Vec<SearchResult> = results
-        .into_iter()
-        .map(|(_score, metadata, bodies, sub_idx, date)| {
-            let meta: serde_json::Value = serde_json::from_str(&metadata).unwrap_or_default();
-            let idx = (sub_idx as usize).min(bodies.len().saturating_sub(1));
-            let turns_arr: Vec<TurnMeta> = meta["turns"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .map(|v| TurnMeta {
-                            role: v["role"].as_str().unwrap_or("").to_string(),
-                            timestamp: v["timestamp"].as_str().unwrap_or("").to_string(),
-                            byte_offset: v["off"].as_u64().unwrap_or(0),
-                            byte_len: v["len"].as_u64().unwrap_or(0),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            SearchResult {
-                timestamp: format_date(&date),
-                project: meta["project"].as_str().unwrap_or("").to_string(),
-                session_id: meta["session_id"].as_str().unwrap_or("").to_string(),
-                turn: meta["turn"].as_u64().unwrap_or(0),
-                path: meta["path"].as_str().unwrap_or("").to_string(),
-                cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
-                source: meta["source"].as_str().unwrap_or("claude").to_string(),
-                conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
-                bodies,
-                match_idx: idx,
-                turns: turns_arr,
-            }
-        })
-        .collect();
-    Ok((out, search_ms))
+fn run_search_with(
+    db: &DB,
+    embedder: &Embedder,
+    q: &str,
+    session: Option<&str>,
+    branch: Option<&str>,
+    exclude: &[String],
+    since_ms: Option<i64>,
+    types: &[String],
+    dm_only: bool,
+    no_dm: bool,
+    unread_only: bool,
+) -> Result<(Vec<SearchResult>, u128)> {
+    let mut cache = witchcraft::EmbeddingsCache::new(1);
+    let sql_filter = build_sql_filter(session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only);
+    let now = std::time::Instant::now();
+    let results = witchcraft::search(
+        db,
+        embedder,
+        &mut cache,
+        q,
+        0.5,
+        10,
+        true,
+        sql_filter.as_ref(),
+    )?;
+    let search_ms = now.elapsed().as_millis();
+    Ok((parse_search_results(results), search_ms))
 }
 
 // --- TUI ---
@@ -538,8 +575,9 @@ enum View {
 fn search_tui(
     db_name: &PathBuf,
     assets: &PathBuf,
-    q: &str,
+    q: Option<&str>,
     session: Option<&str>,
+    branch: Option<&str>,
     exclude: &[String],
     since_ms: Option<i64>,
     types: &[String],
@@ -547,12 +585,27 @@ fn search_tui(
     dm_only: bool,
     no_dm: bool,
     unread_only: bool,
-) -> Result<Option<(String, String, String)>> {
-    let (results, search_ms) = run_search(db_name, assets, q, session, exclude, since_ms, types, num_results, dm_only, no_dm, unread_only)?;
+) -> Result<Option<BranchSession>> {
+    let device = witchcraft::make_device();
+    let embedder = witchcraft::Embedder::new(&device, assets)?;
+    let db = DB::new_reader(db_name.clone()).unwrap();
+    let (mut results, mut search_ms) = match q {
+        Some(q) if !q.is_empty() => {
+            run_search_with(&db, &embedder, q, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only)?
+        }
+        Some(_) => {
+            // Empty query with filters: use filter-only search
+            run_search(db_name, assets, "", session, branch, exclude, since_ms, types, num_results, dm_only, no_dm, unread_only)?
+        }
+        None => {
+            (find_recent_sessions(db_name, branch)?, 0)
+        }
+    };
     if results.is_empty() {
         eprintln!("no results");
         return Ok(None);
     }
+    let mut active_query = q.unwrap_or("sessions").to_string();
 
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use crossterm::terminal::{
@@ -576,8 +629,11 @@ fn search_tui(
     let mut list_state = ListState::default();
     list_state.select(Some(0));
     let mut scroll_offset: usize = 0;
-    let mut resume_session: Option<(String, String, String)> = None;
-    let mut confirm_resume: Option<(String, String, String, String)> = None;
+    let mut resume_session: Option<BranchSession> = None;
+    let mut confirm_resume: Option<BranchSession> = None;
+    let mut searching = false;
+    let mut search_filter = String::new();
+    let mut saved_search: Option<(String, Vec<SearchResult>, u128)> = None;
     struct DetailState {
         result_idx: usize,
         turns: Vec<SessionTurn>,
@@ -586,60 +642,87 @@ fn search_tui(
     let mut detail_cache: Option<DetailState> = None;
 
     loop {
+        if selected >= results.len() {
+            selected = results.len().saturating_sub(1);
+        }
+        list_state.select(if results.is_empty() { None } else { Some(selected) });
+
         terminal.draw(|f| {
             let area = f.area();
             let show_footer = confirm_resume.is_some() && matches!(view, View::Detail(_));
+            let show_search = searching || !search_filter.is_empty();
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints(if show_footer {
-                    vec![Constraint::Length(2), Constraint::Min(0), Constraint::Length(1)]
+                    vec![Constraint::Length(2), Constraint::Length(if show_search { 1 } else { 0 }), Constraint::Min(0), Constraint::Length(1)]
                 } else {
-                    vec![Constraint::Length(2), Constraint::Min(0), Constraint::Length(0)]
+                    vec![Constraint::Length(2), Constraint::Length(if show_search { 1 } else { 0 }), Constraint::Min(0), Constraint::Length(0)]
                 })
                 .split(area);
 
             // Header
+            let help_text = if searching {
+                "type to search  ⏎ done  esc undo"
+            } else {
+                match view {
+                    View::List => "↑↓/jk navigate  ⏎ open  / search  q quit",
+                    View::Detail(idx) if !results[idx].session_id.is_empty() => {
+                        "↑↓/jk scroll  r resume  / search  esc back  q quit"
+                    }
+                    View::Detail(_) => "↑↓/jk scroll  / search  esc back  q quit",
+                }
+            };
+            let stats = if search_ms > 0 {
+                format!("  {} results  {} ms  ", results.len(), search_ms)
+            } else {
+                format!("  {} sessions  ", results.len())
+            };
             let header = Paragraph::new(Line::from(vec![
                 Span::styled(
-                    format!("[[ {q} ]]"),
+                    format!("[[ {} ]]", active_query),
                     Style::default()
                         .fg(Color::Rgb(0, 255, 0))
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
-                    slack::cached_self_user()
-                        .map(|(_id, name)| format!("  (you: {name})"))
-                        .unwrap_or_default(),
+                    stats,
                     Style::default().fg(Color::DarkGray),
                 ),
-                Span::styled(
-                    format!("  {search_ms} ms  "),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    match view {
-                        View::List => "↑↓ navigate  ⏎ open  q quit",
-                        View::Detail(idx) if !results[idx].session_id.is_empty() => {
-                            "↑↓ scroll  r resume session  esc back  q quit"
-                        }
-                        View::Detail(_) => "↑↓ scroll  esc back  q quit",
-                    },
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(help_text, Style::default().fg(Color::DarkGray)),
             ]));
             f.render_widget(header, chunks[0]);
 
+            // Search input bar
+            if show_search {
+                let bar_style = if searching {
+                    Style::default().bg(Color::DarkGray)
+                } else {
+                    Style::default()
+                };
+                let search_bar = Paragraph::new(Line::from(vec![
+                    Span::styled("/ ", Style::default().fg(if searching { Color::White } else { Color::DarkGray })),
+                    Span::styled(
+                        &search_filter,
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                    if searching {
+                        Span::styled("_", Style::default().fg(Color::DarkGray))
+                    } else {
+                        Span::raw("")
+                    },
+                ])).style(bar_style);
+                f.render_widget(search_bar, chunks[1]);
+            }
+
+            let content_area = chunks[2];
+            let footer_area = chunks[3];
+
             // Footer: resume confirmation
             if show_footer {
-                let cwd = confirm_resume.as_ref()
-                    .map(|(_, _, c, _)| c.as_str())
-                    .unwrap_or("?");
-                let sid = confirm_resume.as_ref()
-                    .map(|(s, _, _, _)| s.as_str())
-                    .unwrap_or("?");
-                let src = confirm_resume.as_ref()
-                    .map(|(_, _, _, s)| s.as_str())
-                    .unwrap_or("claude");
+                let cr = confirm_resume.as_ref().unwrap();
+                let cwd = if !cr.cwd.is_empty() { &cr.cwd } else { "?" };
+                let sid = &cr.session_id;
+                let src = &cr.source;
                 let footer = Paragraph::new(Line::from(vec![
                     Span::styled(
                         format!(" Exit pickbrain and resume {src} session {sid} in {cwd}? "),
@@ -652,12 +735,12 @@ fn search_tui(
                         Style::default().add_modifier(Modifier::BOLD),
                     ),
                 ]));
-                f.render_widget(footer, chunks[2]);
+                f.render_widget(footer, footer_area);
             }
 
             match view {
                 View::List => {
-                    let width = chunks[1].width as usize;
+                    let width = content_area.width as usize;
                     let items: Vec<ratatui::widgets::ListItem> = results
                         .iter()
                         .map(|r| {
@@ -677,39 +760,19 @@ fn search_tui(
                                 .filter(|tm| !tm.timestamp.is_empty())
                                 .map(|tm| format_date(&tm.timestamp))
                                 .unwrap_or_else(|| r.timestamp.clone());
-                            let mut meta_spans = vec![
-                                Span::styled(
-                                    format!("{ts} "),
-                                    Style::default().fg(Color::Green),
-                                ),
-                                Span::styled(&r.project, Style::default().fg(Color::Cyan)),
-                            ];
+                            let mut meta_spans = session_meta_spans(
+                                &ts, &r.project, &r.session_id, &r.session_name, &r.source, &r.branch, &r.conv_key,
+                            );
                             if r.path.ends_with(".md") {
                                 meta_spans.push(Span::styled(
                                     format!("  {}", r.path),
                                     Style::default().fg(Color::Yellow),
                                 ));
                             }
-                            if r.source == "slack" {
-                                let tag = slack_conv_tag(&r.conv_key);
+                            if !r.session_id.is_empty() {
                                 meta_spans.push(Span::styled(
-                                    format!("  slack {tag}"),
-                                    Style::default().fg(Color::Magenta),
-                                ));
-                            } else if !r.session_id.is_empty() {
-                                let source_label = if r.source == "codex" {
-                                    "codex"
-                                } else {
-                                    "claude"
-                                };
-                                let short_sid = if r.session_id.len() > 8 {
-                                    &r.session_id[..8]
-                                } else {
-                                    &r.session_id
-                                };
-                                meta_spans.push(Span::styled(
-                                    format!("  {source_label} {short_sid}  turn {}", r.turn),
-                                    Style::default().fg(Color::Magenta),
+                                    format!("  turn {}", r.turn),
+                                    Style::default().fg(Color::DarkGray),
                                 ));
                             }
                             let match_role = matched_tm.map(|tm| tm.role.as_str()).unwrap_or("");
@@ -740,12 +803,15 @@ fn search_tui(
                         })
                         .collect();
 
-                    let list = ratatui::widgets::List::new(items).highlight_style(
+                    let highlight = if searching {
+                        Style::default()
+                    } else {
                         Style::default()
                             .bg(Color::DarkGray)
-                            .add_modifier(Modifier::BOLD),
-                    );
-                    f.render_stateful_widget(list, chunks[1], &mut list_state);
+                            .add_modifier(Modifier::BOLD)
+                    };
+                    let list = ratatui::widgets::List::new(items).highlight_style(highlight);
+                    f.render_stateful_widget(list, content_area, &mut list_state);
                 }
                 View::Detail(idx) => {
                     let r = &results[idx];
@@ -760,13 +826,26 @@ fn search_tui(
                         Span::styled(&r.project, Style::default().fg(Color::Cyan)),
                     ]));
                     if !r.session_id.is_empty() {
-                        lines.push(Line::from(vec![
+                        let mut session_spans = vec![
                             Span::styled(&r.session_id, Style::default().fg(Color::Magenta)),
-                            Span::styled(
-                                format!("  turn {}", r.turn),
-                                Style::default().fg(Color::DarkGray),
-                            ),
-                        ]));
+                        ];
+                        if !r.session_name.is_empty() {
+                            session_spans.push(Span::styled(
+                                format!("  \"{}\"", r.session_name),
+                                Style::default().fg(Color::White),
+                            ));
+                        }
+                        session_spans.push(Span::styled(
+                            format!("  turn {}", r.turn),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                        if !r.branch.is_empty() {
+                            session_spans.push(Span::styled(
+                                format!("  {}", r.branch),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
+                        lines.push(Line::from(session_spans));
                     }
                     lines.push(Line::from(""));
 
@@ -833,12 +912,85 @@ fn search_tui(
                     let detail = Paragraph::new(lines)
                         .wrap(Wrap { trim: false })
                         .scroll((scroll_offset as u16, 0));
-                    f.render_widget(detail, chunks[1]);
+                    f.render_widget(detail, content_area);
                 }
             }
         })?;
 
         if let Event::Key(key) = event::read()? {
+            // Search mode: live-search as the user types
+            if searching {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Esc, _) => {
+                        searching = false;
+                        search_filter.clear();
+                        if let Some((q, r, ms)) = saved_search.take() {
+                            active_query = q;
+                            results = r;
+                            search_ms = ms;
+                            selected = 0;
+                            detail_cache = None;
+                            view = View::List;
+                        }
+                        continue;
+                    }
+                    (KeyCode::Enter, _) => {
+                        searching = false;
+                        saved_search = None;
+                        continue;
+                    }
+                    (KeyCode::Down, _) | (KeyCode::Up, _) => {
+                        searching = false;
+                        saved_search = None;
+                        view = View::List;
+                        continue;
+                    }
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                    (KeyCode::Backspace, _) => {
+                        search_filter.pop();
+                        if search_filter.chars().count() >= 3 && search_filter != active_query {
+                            if let Ok((new_results, ms)) = run_search_with(
+                                &db, &embedder, &search_filter, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only,
+                            ) {
+                                active_query = search_filter.clone();
+                                results = new_results;
+                                search_ms = ms;
+                                selected = 0;
+                                detail_cache = None;
+                                view = View::List;
+                            }
+                        } else if search_filter.is_empty() {
+                            if let Some((ref q, ref r, ms)) = saved_search {
+                                active_query = q.clone();
+                                results = r.clone();
+                                search_ms = ms;
+                                selected = 0;
+                                detail_cache = None;
+                                view = View::List;
+                            }
+                        }
+                        continue;
+                    }
+                    (KeyCode::Char(c), _) => {
+                        search_filter.push(c);
+                        if search_filter.chars().count() >= 3 && search_filter != active_query {
+                            if let Ok((new_results, ms)) = run_search_with(
+                                &db, &embedder, &search_filter, session, branch, exclude, since_ms, types, dm_only, no_dm, unread_only,
+                            ) {
+                                active_query = search_filter.clone();
+                                results = new_results;
+                                search_ms = ms;
+                                selected = 0;
+                                detail_cache = None;
+                                view = View::List;
+                            }
+                        }
+                        continue;
+                    }
+                    _ => { continue; }
+                }
+            }
+
             match (&view, key.code, key.modifiers) {
                 (_, KeyCode::Char('q') | KeyCode::Esc, _) if confirm_resume.is_some() => {
                     confirm_resume = None;
@@ -846,8 +998,15 @@ fn search_tui(
                 (View::Detail(_), KeyCode::Char('q') | KeyCode::Esc, _) => {
                     view = View::List;
                 }
-                (View::List, KeyCode::Char('q') | KeyCode::Esc, _) => break,
+                (View::List, KeyCode::Char('q'), _) => break,
+                (View::List, KeyCode::Esc, _) => break,
                 (_, KeyCode::Char('c'), KeyModifiers::CONTROL) => break,
+                (_, KeyCode::Char('f'), KeyModifiers::CONTROL) |
+                (_, KeyCode::Char('/'), _) => {
+                    searching = true;
+                    search_filter.clear();
+                    saved_search = Some((active_query.clone(), results.clone(), search_ms));
+                }
                 (_, KeyCode::Char('z'), KeyModifiers::CONTROL) => {
                     disable_raw_mode()?;
                     crossterm::execute!(
@@ -856,14 +1015,12 @@ fn search_tui(
                         crossterm::cursor::Show
                     )?;
                     unsafe { libc::raise(libc::SIGTSTP); }
-                    // When resumed (fg), re-enter TUI
                     enable_raw_mode()?;
                     crossterm::execute!(
                         std::io::stdout(),
                         EnterAlternateScreen,
                         crossterm::cursor::Hide
                     )?;
-                    // Force full redraw
                     terminal.clear()?;
                 }
 
@@ -881,34 +1038,35 @@ fn search_tui(
                     }
                 }
                 (View::List, KeyCode::Enter, _) => {
-                    let r = &results[selected];
-                    if !r.session_id.is_empty() && !r.path.is_empty() && !r.turns.is_empty() {
-                        let mi = if r.match_idx > 0 { r.match_idx - 1 } else { 0 };
-                        let mut turns = Vec::new();
-                        for tm in &r.turns {
-                            if let Some(turn) = read_turn_at(&r.path, &r.source, tm) {
-                                turns.push(turn);
+                    if selected < results.len() {
+                        let r = &results[selected];
+                        if !r.session_id.is_empty() && !r.path.is_empty() && !r.turns.is_empty() {
+                            let mi = if r.match_idx > 0 { r.match_idx - 1 } else { 0 };
+                            let mut turns = Vec::new();
+                            for tm in &r.turns {
+                                if let Some(turn) = read_turn_at(&r.path, &r.source, tm) {
+                                    turns.push(turn);
+                                }
                             }
+                            let mut pre_lines: usize = if r.session_id.is_empty() { 2 } else { 3 };
+                            for t in &turns[..mi.min(turns.len())] {
+                                pre_lines += 2 + t.text.lines().count();
+                            }
+                            scroll_offset = pre_lines;
+                            detail_cache = Some(DetailState {
+                                result_idx: selected,
+                                turns,
+                                highlight: mi,
+                            });
+                        } else {
+                            scroll_offset = 0;
+                            detail_cache = None;
                         }
-                        // Position viewport at the highlight turn
-                        let mut pre_lines: usize = if r.session_id.is_empty() { 2 } else { 3 };
-                        for t in &turns[..mi.min(turns.len())] {
-                            pre_lines += 2 + t.text.lines().count();
-                        }
-                        scroll_offset = pre_lines;
-                        detail_cache = Some(DetailState {
-                            result_idx: selected,
-                            turns,
-                            highlight: mi,
-                        });
-                    } else {
-                        scroll_offset = 0;
-                        detail_cache = None;
+                        view = View::Detail(selected);
                     }
-                    view = View::Detail(selected);
                 }
 
-                // Detail view: j/k line scroll
+                // Detail view
                 (View::Detail(_), KeyCode::Down | KeyCode::Char('j'), _) => {
                     scroll_offset = scroll_offset.saturating_add(1);
                 }
@@ -922,14 +1080,19 @@ fn search_tui(
                             r.cwd.clone()
                         } else {
                             read_cwd_from_jsonl(&r.path, &r.source)
-                                .unwrap_or_else(|| "?".to_string())
+                                .unwrap_or_default()
                         };
-                        confirm_resume = Some((r.session_id.clone(), r.path.clone(), cwd, r.source.clone()));
+                        confirm_resume = Some(BranchSession {
+                            session_id: r.session_id.clone(),
+                            source: r.source.clone(),
+                            branch: r.branch.clone(),
+                            cwd,
+                        });
                     }
                 }
                 (View::Detail(_), KeyCode::Char('y') | KeyCode::Enter, _) => {
-                    if let Some((ref sid, ref path, _, ref source)) = confirm_resume {
-                        resume_session = Some((sid.clone(), path.clone(), source.clone()));
+                    if confirm_resume.is_some() {
+                        resume_session = confirm_resume.take();
                         break;
                     }
                 }
@@ -967,12 +1130,58 @@ fn read_cwd_from_jsonl(path: &str, source: &str) -> Option<String> {
     None
 }
 
-fn launch_resume(session_id: &str, jsonl_path: &str, source: &str) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    if let Some(cwd) = read_cwd_from_jsonl(jsonl_path, source) {
-        let _ = std::env::set_current_dir(&cwd);
+/// Returns true only if `git status --porcelain` succeeds with empty output
+/// (i.e. no staged, unstaged, or untracked changes). Returns false if not
+/// in a git repo or if the tree is dirty.
+fn git_working_tree_clean() -> bool {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain"])
+        .output()
+        .map(|o| o.status.success() && o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+fn maybe_checkout_branch(branch: &str) {
+    use std::io::IsTerminal;
+    if branch.is_empty() || !std::io::stderr().is_terminal() {
+        return;
     }
-    if source == "codex" {
+    let current = current_git_branch().unwrap_or_default();
+    if current == branch {
+        return;
+    }
+    if !git_working_tree_clean() {
+        eprintln!(
+            "warning: working tree is dirty, staying on '{current}' \
+             (stash or commit before switching to '{branch}')"
+        );
+        return;
+    }
+    eprint!("Switch from '{current}' to '{branch}'? [y/N] ");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).ok();
+    if answer.trim().eq_ignore_ascii_case("y") {
+        let status = std::process::Command::new("git")
+            .args(["checkout", branch])
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(_) => eprintln!("warning: git checkout '{branch}' failed, continuing on '{current}'"),
+            Err(e) => eprintln!("warning: git checkout failed: {e}"),
+        }
+    }
+}
+
+fn launch_resume(s: &BranchSession, checkout_branch: bool) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    if !s.cwd.is_empty() {
+        let _ = std::env::set_current_dir(&s.cwd);
+    }
+    if checkout_branch {
+        maybe_checkout_branch(&s.branch);
+    }
+    let session_id = &s.session_id;
+    if s.source == "codex" {
         eprintln!("Resuming codex session {session_id}...");
         let err = std::process::Command::new("codex")
             .args(["resume", session_id])
@@ -1030,6 +1239,7 @@ fn search_plain(
     assets: &PathBuf,
     q: &str,
     session: Option<&str>,
+    branch: Option<&str>,
     exclude: &[String],
     since_ms: Option<i64>,
     types: &[String],
@@ -1038,7 +1248,7 @@ fn search_plain(
     no_dm: bool,
     unread_only: bool,
 ) -> Result<()> {
-    let (results, search_ms) = run_search(db_name, assets, q, session, exclude, since_ms, types, num_results, dm_only, no_dm, unread_only)?;
+    let (results, search_ms) = run_search(db_name, assets, q, session, branch, exclude, since_ms, types, num_results, dm_only, no_dm, unread_only)?;
 
     let mut buf = Vec::new();
     let you = slack::cached_self_user()
@@ -1068,11 +1278,21 @@ fn search_plain(
             let tag = slack_conv_tag(&r.conv_key);
             format!("  {source_label} {tag}")
         } else if !r.session_id.is_empty() {
-            format!("  {source_label} {} turn {}", r.session_id, r.turn)
+            let name_info = if !r.session_name.is_empty() {
+                format!(" \"{}\"", r.session_name)
+            } else {
+                String::new()
+            };
+            format!("  {source_label} {}{name_info} turn {}", r.session_id, r.turn)
         } else {
             String::new()
         };
-        writeln!(buf, "{ts}  {}{filename}{session_info}", r.project)?;
+        let branch_info = if !r.branch.is_empty() {
+            format!("  [{}]", r.branch)
+        } else {
+            String::new()
+        };
+        writeln!(buf, "{ts}  {}{filename}{session_info}{branch_info}", r.project)?;
         if r.source == "slack" || r.turns.is_empty() || r.path.is_empty() {
             // Slack and .md files: use indexed bodies directly
             let idx = r.match_idx;
@@ -1113,6 +1333,142 @@ fn search_plain(
     }
     std::io::stdout().write_all(&buf)?;
     Ok(())
+}
+
+/// Build styled spans for session metadata display. Returns `Span<'static>`
+/// because all values are owned (format!/to_string), not borrowed from args.
+fn session_meta_spans(
+    date: &str,
+    project: &str,
+    session_id: &str,
+    session_name: &str,
+    source: &str,
+    branch: &str,
+    conv_key: &str,
+) -> Vec<ratatui::text::Span<'static>> {
+    use ratatui::style::{Color, Style};
+    use ratatui::text::Span;
+
+    let mut spans = vec![
+        Span::styled(format!("{} ", format_date(date)), Style::default().fg(Color::Green)),
+        Span::styled(project.to_string(), Style::default().fg(Color::Cyan)),
+    ];
+    if source == "slack" {
+        let tag = slack_conv_tag(conv_key);
+        spans.push(Span::styled(
+            format!("  slack {tag}"),
+            Style::default().fg(Color::Magenta),
+        ));
+    } else if !session_id.is_empty() {
+        let source_label = if source == "codex" { "codex" } else { "claude" };
+        let short_sid = if session_id.len() > 8 { &session_id[..8] } else { session_id };
+        spans.push(Span::styled(
+            format!("  {source_label} {short_sid}"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    if !session_name.is_empty() {
+        spans.push(Span::styled(
+            format!("  \"{session_name}\""),
+            Style::default().fg(Color::White),
+        ));
+    }
+    if !branch.is_empty() {
+        spans.push(Span::styled(
+            format!("  {branch}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans
+}
+
+fn current_git_branch() -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    if branch.is_empty() || branch == "HEAD" {
+        None
+    } else {
+        Some(branch)
+    }
+}
+
+#[derive(Clone)]
+struct BranchSession {
+    session_id: String,
+    source: String,
+    branch: String,
+    cwd: String,
+}
+
+
+fn find_recent_sessions(db_name: &PathBuf, branch: Option<&str>) -> Result<Vec<SearchResult>> {
+    let db = DB::new_reader(db_name.clone()).unwrap();
+    let sql = if branch.is_some() {
+        "SELECT metadata, body, MAX(date) as date
+         FROM document
+         WHERE json_extract(metadata, '$.session_id') IS NOT NULL
+           AND json_extract(metadata, '$.session_id') != ''
+           AND json_extract(metadata, '$.branch') = ?1
+         GROUP BY json_extract(metadata, '$.session_id')
+         ORDER BY date DESC
+         LIMIT 200"
+    } else {
+        "SELECT metadata, body, MAX(date) as date
+         FROM document
+         WHERE json_extract(metadata, '$.session_id') IS NOT NULL
+           AND json_extract(metadata, '$.session_id') != ''
+         GROUP BY json_extract(metadata, '$.session_id')
+         ORDER BY date DESC
+         LIMIT 200"
+    };
+    let mut stmt = db.query(sql)?;
+    let rows: Vec<(String, String, String)> = if let Some(br) = branch {
+        stmt.query_map((br,), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .filter_map(|r| r.ok()).collect()
+    } else {
+        stmt.query_map((), |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .filter_map(|r| r.ok()).collect()
+    };
+
+    let mut results = Vec::new();
+    for (metadata, body, date) in &rows {
+        let meta: serde_json::Value = serde_json::from_str(metadata).unwrap_or_default();
+        let turns_arr: Vec<TurnMeta> = meta["turns"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .map(|v| TurnMeta {
+                        role: v["role"].as_str().unwrap_or("").to_string(),
+                        timestamp: v["timestamp"].as_str().unwrap_or("").to_string(),
+                        byte_offset: v["off"].as_u64().unwrap_or(0),
+                        byte_len: v["len"].as_u64().unwrap_or(0),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        results.push(SearchResult {
+            timestamp: format_date(date),
+            project: meta["project"].as_str().unwrap_or("").to_string(),
+            session_id: meta["session_id"].as_str().unwrap_or("").to_string(),
+            session_name: meta["session_name"].as_str().unwrap_or("").to_string(),
+            turn: meta["turn"].as_u64().unwrap_or(0),
+            path: meta["path"].as_str().unwrap_or("").to_string(),
+            cwd: meta["cwd"].as_str().unwrap_or("").to_string(),
+            source: meta["source"].as_str().unwrap_or("claude").to_string(),
+            branch: meta["branch"].as_str().unwrap_or("").to_string(),
+            conv_key: meta["conv_key"].as_str().unwrap_or("").to_string(),
+            bodies: vec![body.clone()],
+            match_idx: 0,
+            turns: turns_arr,
+        });
+    }
+    Ok(results)
 }
 
 fn format_date(iso: &str) -> String {
@@ -1324,6 +1680,7 @@ fn main() -> Result<()> {
 
     let args: Vec<String> = env::args().skip(1).collect();
     let mut session_filter: Option<String> = None;
+    let mut branch_filter: Option<String> = None;
     let mut exclude_sessions: Vec<String> = Vec::new();
     let mut since_ms: Option<i64> = None;
     let mut type_filter: Vec<String> = Vec::new();
@@ -1339,6 +1696,30 @@ fn main() -> Result<()> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--help" | "-h" => {
+                eprintln!("Usage:");
+                eprintln!("  pickbrain [options] [query]");
+                eprintln!("  pickbrain --dump <session-id|channel|thr:ts> [--turns N-M] [--since T]");
+                eprintln!("  pickbrain --nuke");
+                eprintln!();
+                eprintln!("With no arguments, opens an interactive session browser.");
+                eprintln!();
+                eprintln!("Options:");
+                eprintln!("  --branch NAME|.      filter by git branch (. = current)");
+                eprintln!("  --current            search within the calling session");
+                eprintln!("  --exclude UUID,...   exclude sessions from results");
+                eprintln!("  --exclude-current    exclude the calling session");
+                eprintln!("  --session ID         search within a session, channel, or thread");
+                eprintln!("  --since 24h|7d|2w    only search recent history");
+                eprintln!("  --type claude,slack  filter by source (claude, codex, slack)");
+                eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
+                eprintln!("  --dm                 only DMs (Slack)");
+                eprintln!("  --no-dm              exclude DMs (Slack)");
+                eprintln!("  --unread             only unread conversations (Slack)");
+                eprintln!("  --dump ID            dump a session, channel, or thread");
+                eprintln!("  --turns N-M          limit turns/conversations in dump");
+                std::process::exit(0);
+            }
             "--nuke" => {
                 let db_name = db_path();
                 if db_name.exists() {
@@ -1354,6 +1735,9 @@ fn main() -> Result<()> {
             }
             "--session" | "--channel" => {
                 session_filter = iter.next().cloned();
+            }
+            "--branch" => {
+                branch_filter = iter.next().cloned();
             }
             "--exclude" => {
                 if let Some(val) = iter.next() {
@@ -1422,6 +1806,15 @@ fn main() -> Result<()> {
         }
     }
 
+    // Resolve `--branch .` to the current git branch
+    if branch_filter.as_deref() == Some(".") {
+        branch_filter = current_git_branch();
+        if branch_filter.is_none() {
+            eprintln!("error: --branch . used but not in a git repo");
+            std::process::exit(1);
+        }
+    }
+
     use std::io::IsTerminal;
     if std::io::stderr().is_terminal() {
         eprintln!("pickbrain {} — Copyright (c) 2026 Dropbox Inc.", env!("CARGO_PKG_VERSION"));
@@ -1479,8 +1872,10 @@ fn main() -> Result<()> {
         }
     }
 
+    let has_branch = branch_filter.is_some();
     let has_filters = session_filter.is_some() || !exclude_sessions.is_empty() || since_ms.is_some()
-        || !type_filter.is_empty() || dm_only || no_dm || unread_only || current || exclude_current;
+        || !type_filter.is_empty() || dm_only || no_dm || unread_only || current || exclude_current
+        || has_branch;
 
     if let Some(ref sid) = dump_session {
         dump(&db_name, sid, turns_range.as_deref(), since_ms)?;
@@ -1488,31 +1883,58 @@ fn main() -> Result<()> {
         let q = query_args.join(" ");
         if std::io::stdout().is_terminal() {
             let n = num_results.unwrap_or(0);
-            if let Some((sid, path, source)) = search_tui(&db_name, &assets, &q, session_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, n, dm_only, no_dm, unread_only)? {
-                launch_resume(&sid, &path, &source)?;
+            if let Some(s) = search_tui(&db_name, &assets, Some(&q), session_filter.as_deref(), branch_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, n, dm_only, no_dm, unread_only)? {
+                launch_resume(&s, has_branch)?;
             }
         } else {
             let n = num_results.unwrap_or(20);
-            search_plain(&db_name, &assets, &q, session_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, n, dm_only, no_dm, unread_only)?;
+            search_plain(&db_name, &assets, &q, session_filter.as_deref(), branch_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, n, dm_only, no_dm, unread_only)?;
         }
     } else {
-        eprintln!("Usage: pickbrain [options] <query>");
-        eprintln!("       pickbrain --dump <session-id|channel|thr:ts> [--turns N-M] [--since T]");
-        eprintln!("       pickbrain --nuke");
-        eprintln!();
-        eprintln!("Options:");
-        eprintln!("  --session ID         search within a session, channel, or thread");
-        eprintln!("  --current            search within the calling session");
-        eprintln!("  --exclude UUID,...   exclude sessions from results");
-        eprintln!("  --exclude-current    exclude the calling session");
-        eprintln!("  --since 24h|7d|2w    only search recent history");
-        eprintln!("  --type claude,slack  filter by source (claude, codex, slack)");
-        eprintln!("  -n N                 number of results (0=unlimited, default: unlimited in TUI, 20 in pipe)");
-        eprintln!("  --dm                 only DMs (Slack)");
-        eprintln!("  --no-dm              exclude DMs (Slack)");
-        eprintln!("  --unread             only unread conversations (Slack)");
-        eprintln!("  --dump ID            dump a session, channel, or thread");
-        eprintln!("  --turns N-M          limit turns/conversations in dump");
+        if let Some(s) = search_tui(&db_name, &assets, None, session_filter.as_deref(), branch_filter.as_deref(), &exclude_sessions, since_ms, &type_filter, 0, dm_only, no_dm, unread_only)? {
+            launch_resume(&s, has_branch)?;
+        }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_format_date() {
+        assert_eq!(format_date("2025-01-15T10:30:00Z"), "Jan 15 10:30");
+        assert_eq!(format_date("bad"), "??? ?? ??:??");
+    }
+
+    #[test]
+    fn test_parse_range() {
+        assert_eq!(parse_range("3-7"), (3, 7));
+        assert_eq!(parse_range("5"), (5, 5));
+    }
+
+    #[test]
+    fn test_build_sql_filter_none() {
+        assert!(build_sql_filter(None, None, &[], None, &[], false, false, false).is_none());
+    }
+
+    #[test]
+    fn test_build_sql_filter_branch_only() {
+        use witchcraft::types::*;
+        let f = build_sql_filter(None, Some("main"), &[], None, &[], false, false, false).unwrap();
+        assert_eq!(f.statement_type, SqlStatementType::Condition);
+        let cond = f.condition.unwrap();
+        assert_eq!(cond.key, "$.branch");
+    }
+
+    #[test]
+    fn test_build_sql_filter_both() {
+        use witchcraft::types::*;
+        let f = build_sql_filter(Some("abc"), Some("main"), &[], None, &[], false, false, false).unwrap();
+        assert_eq!(f.statement_type, SqlStatementType::Group);
+        assert_eq!(f.logic, Some(SqlLogic::And));
+        assert_eq!(f.statements.unwrap().len(), 2);
+    }
+
 }
