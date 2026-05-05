@@ -48,6 +48,7 @@ struct ParsedMessage {
     normalized_text: String,
     client_msg_id: Option<String>,
     is_broadcast: bool,
+    is_update: bool,
     team_id: String,
 }
 
@@ -60,6 +61,7 @@ struct Conversation {
     root_ref_ts: String,
     first_ts_ms: i64,
     latest_ts_ms: i64,
+    latest_ref_ts: String,
     has_unread: bool,
     unread_count: usize,
     messages: Vec<ConvMessage>,
@@ -220,6 +222,20 @@ fn should_skip_message(msg: &Value, members: &Value) -> bool {
     }
     let text = msg.get("text").and_then(|v| v.as_str()).unwrap_or("");
     text.is_empty()
+}
+
+fn effective_message(msg: &Value) -> Option<(&Value, bool)> {
+    let subtype = msg.get("subtype").and_then(|v| v.as_str()).unwrap_or("");
+    if subtype == "message_changed" {
+        return msg
+            .get("message")
+            .filter(|message| message.is_object())
+            .map(|message| (message, true));
+    }
+    if subtype == "message_deleted" {
+        return None;
+    }
+    Some((msg, false))
 }
 
 fn strip_code(s: &str) -> String {
@@ -445,6 +461,11 @@ fn ts_to_ms(ts: &str) -> Option<i64> {
     if ms > 0 { Some(ms) } else { None }
 }
 
+fn ts_to_secs(ts: &str) -> Option<f64> {
+    let secs: f64 = ts.parse().ok()?;
+    if secs > 0.0 { Some(secs) } else { None }
+}
+
 fn collect_messages(state: &Value, self_user: Option<&(String, String)>) -> Vec<ParsedMessage> {
     let messages = match state.get("messages").and_then(|v| v.as_object()) {
         Some(m) => m,
@@ -478,6 +499,10 @@ fn collect_messages(state: &Value, self_user: Option<&(String, String)>) -> Vec<
             .unwrap_or(false);
 
         for (_ts, msg) in thread_bucket {
+            let (msg, is_update) = match effective_message(msg) {
+                Some(message) => message,
+                None => continue,
+            };
             let ts = match msg.get("ts").and_then(|v| v.as_str()) {
                 Some(t) => t,
                 None => continue,
@@ -518,6 +543,7 @@ fn collect_messages(state: &Value, self_user: Option<&(String, String)>) -> Vec<
                     .and_then(|v| v.as_str())
                     .map(String::from),
                 is_broadcast,
+                is_update,
                 team_id: team_id.to_string(),
             });
         }
@@ -535,7 +561,7 @@ fn dedup_broadcasts(messages: Vec<ParsedMessage>) -> Vec<ParsedMessage> {
     for msg in messages {
         if let Some(ref cid) = msg.client_msg_id {
             if let Some(&prev_idx) = by_client.get(cid) {
-                if !msg.is_broadcast && all[prev_idx].is_broadcast {
+                if msg.is_update || (!msg.is_broadcast && all[prev_idx].is_broadcast) {
                     all[prev_idx] = msg;
                 }
             } else {
@@ -546,7 +572,7 @@ fn dedup_broadcasts(messages: Vec<ParsedMessage>) -> Vec<ParsedMessage> {
         } else {
             let ts_key = msg.ts.clone();
             if let Some(&prev_idx) = by_ts.get(&ts_key) {
-                if !msg.is_broadcast && all[prev_idx].is_broadcast {
+                if msg.is_update || (!msg.is_broadcast && all[prev_idx].is_broadcast) {
                     all[prev_idx] = msg;
                 }
             } else {
@@ -636,6 +662,7 @@ fn group_into_conversations(
             root_ref_ts: root_ref_ts.clone(),
             first_ts_ms: msg.ts_ms,
             latest_ts_ms: msg.ts_ms,
+            latest_ref_ts: msg.ts.clone(),
             has_unread: false,
             unread_count: 0,
             messages: Vec::new(),
@@ -648,7 +675,12 @@ fn group_into_conversations(
             }
         }
 
-        conv.latest_ts_ms = conv.latest_ts_ms.max(msg.ts_ms);
+        if msg.ts_ms > conv.latest_ts_ms
+            || (msg.ts_ms == conv.latest_ts_ms && msg.ts > conv.latest_ref_ts)
+        {
+            conv.latest_ts_ms = msg.ts_ms;
+            conv.latest_ref_ts = msg.ts.clone();
+        }
         conv.messages.push(ConvMessage {
             ts_ms: msg.ts_ms,
             labeled,
@@ -661,6 +693,57 @@ fn group_into_conversations(
     }
     result.sort_by_key(|c| c.first_ts_ms);
     result
+}
+
+fn session_key_ts_secs(conv_key: &str) -> Option<f64> {
+    let ts = conv_key.strip_prefix("sess:")?.rsplit_once('-')?.1;
+    ts_to_secs(ts)
+}
+
+fn remove_subsumed_session_docs(db: &mut DB, conv: &Conversation) -> Result<()> {
+    if !conv.key.starts_with("sess:") {
+        return Ok(());
+    }
+    let Some(first_secs) = ts_to_secs(&conv.root_ref_ts) else {
+        return Ok(());
+    };
+    let Some(latest_secs) = ts_to_secs(&conv.latest_ref_ts) else {
+        return Ok(());
+    };
+
+    let mut query = db.query(
+        "SELECT uuid, json_extract(metadata, '$.conv_key')
+         FROM document
+         WHERE json_extract(metadata, '$.source') = 'slack'
+           AND json_extract(metadata, '$.channel_id') = ?1
+           AND COALESCE(json_extract(metadata, '$.team_id'), '') = ?2
+           AND json_extract(metadata, '$.conv_key') LIKE 'sess:%'",
+    )?;
+    let rows = query.query_map((&conv.channel_id, &conv.team_id), |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+
+    let mut stale = Vec::new();
+    for row in rows {
+        let (uuid, conv_key) = row?;
+        if conv_key == conv.key {
+            continue;
+        }
+        let Some(root_secs) = session_key_ts_secs(&conv_key) else {
+            continue;
+        };
+        if root_secs > first_secs && root_secs <= latest_secs {
+            if let Ok(uuid) = Uuid::parse_str(&uuid) {
+                stale.push(uuid);
+            }
+        }
+    }
+    drop(query);
+
+    for uuid in stale {
+        db.remove_doc(&uuid)?;
+    }
+    Ok(())
 }
 
 fn ingest_conversations(db: &mut DB, conversations: Vec<Conversation>) -> Result<usize> {
@@ -677,6 +760,8 @@ fn ingest_conversations(db: &mut DB, conversations: Vec<Conversation>) -> Result
             .iter()
             .map(|m| m.labeled.chars().count())
             .collect();
+
+        remove_subsumed_session_docs(db, conv)?;
 
         let uuid = Uuid::new_v5(
             &SLACK_NAMESPACE,
@@ -705,6 +790,8 @@ fn ingest_conversations(db: &mut DB, conversations: Vec<Conversation>) -> Result
             "is_dm": conv.is_dm,
             "team_id": conv.team_id,
             "conv_key": conv.key,
+            "root_ts": conv.root_ref_ts,
+            "latest_ts": conv.latest_ref_ts,
             "turn": turn,
             "session_id": conv.channel_id,
             "message_count": conv.messages.len(),
@@ -790,4 +877,129 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    #[test]
+    fn changed_messages_keep_original_message_identity() {
+        let state = json!({
+            "messages": {
+                "C1": {
+                    "1000.000100": {
+                        "type": "message",
+                        "user": "U1",
+                        "text": "original root",
+                        "ts": "1000.000100",
+                        "client_msg_id": "m1",
+                        "source_team_id": "T1"
+                    },
+                    "1000.000999": {
+                        "type": "message",
+                        "subtype": "message_changed",
+                        "ts": "1000.000999",
+                        "message": {
+                            "type": "message",
+                            "user": "U1",
+                            "text": "edited root",
+                            "ts": "1000.000100",
+                            "client_msg_id": "m1",
+                            "source_team_id": "T1"
+                        }
+                    },
+                    "1000.000200": {
+                        "type": "message",
+                        "user": "U2",
+                        "text": "reply",
+                        "ts": "1000.000200",
+                        "source_team_id": "T1"
+                    }
+                }
+            },
+            "members": {
+                "U1": {"real_name": "Ada", "name": "ada"},
+                "U2": {"real_name": "Ben", "name": "ben"}
+            },
+            "channels": {
+                "C1": {"name": "general", "is_im": false}
+            },
+            "selfTeamIds": {"defaultWorkspaceId": "T1"}
+        });
+
+        let messages = collect_messages(&state, None);
+        let deduped = dedup_broadcasts(messages);
+        assert_eq!(deduped.len(), 2);
+        assert_eq!(deduped[0].ts, "1000.000100");
+        assert_eq!(deduped[0].normalized_text, "edited root");
+
+        let conversations = group_into_conversations(deduped, &HashMap::new());
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(conversations[0].key, "sess:C1-1000.000100");
+    }
+
+    #[test]
+    fn ingest_removes_subsumed_stale_session_doc() -> Result<()> {
+        let dir = tempdir()?;
+        let mut db = DB::new(dir.path().join("pickbrain.db"))?;
+
+        let stale = Conversation {
+            key: "sess:C1-1000.000200".to_string(),
+            channel_id: "C1".to_string(),
+            channel_name: "general".to_string(),
+            is_dm: false,
+            team_id: "T1".to_string(),
+            root_ref_ts: "1000.000200".to_string(),
+            first_ts_ms: ts_to_ms("1000.000200").unwrap(),
+            latest_ts_ms: ts_to_ms("1000.000200").unwrap(),
+            latest_ref_ts: "1000.000200".to_string(),
+            has_unread: false,
+            unread_count: 0,
+            messages: vec![ConvMessage {
+                ts_ms: ts_to_ms("1000.000200").unwrap(),
+                labeled: "[Ben] reply\n".to_string(),
+            }],
+        };
+        ingest_conversations(&mut db, vec![stale])?;
+
+        let current = Conversation {
+            key: "sess:C1-1000.000100".to_string(),
+            channel_id: "C1".to_string(),
+            channel_name: "general".to_string(),
+            is_dm: false,
+            team_id: "T1".to_string(),
+            root_ref_ts: "1000.000100".to_string(),
+            first_ts_ms: ts_to_ms("1000.000100").unwrap(),
+            latest_ts_ms: ts_to_ms("1000.000200").unwrap(),
+            latest_ref_ts: "1000.000200".to_string(),
+            has_unread: false,
+            unread_count: 0,
+            messages: vec![
+                ConvMessage {
+                    ts_ms: ts_to_ms("1000.000100").unwrap(),
+                    labeled: "[Ada] edited root\n".to_string(),
+                },
+                ConvMessage {
+                    ts_ms: ts_to_ms("1000.000200").unwrap(),
+                    labeled: "[Ben] reply\n".to_string(),
+                },
+            ],
+        };
+        ingest_conversations(&mut db, vec![current])?;
+
+        let row_count: i64 = db
+            .query("SELECT COUNT(*) FROM document")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(row_count, 1);
+
+        let conv_key: String = db
+            .query("SELECT json_extract(metadata, '$.conv_key') FROM document")?
+            .query_row((), |row| row.get(0))?;
+        assert_eq!(conv_key, "sess:C1-1000.000100");
+
+        Ok(())
+    }
 }

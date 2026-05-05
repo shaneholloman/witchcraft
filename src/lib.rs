@@ -2,7 +2,7 @@ use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 #[cfg(feature = "deterministic")]
 use rand::SeedableRng;
-use rusqlite::Statement;
+use rusqlite::{OptionalExtension, Statement};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::RwLock;
@@ -1577,7 +1577,7 @@ pub fn search(
             Some(score) => *score,
             None => 0.0f32,
         };
-        let (metadata, bodies, date) = body_query.query_row((idx,), |row| {
+        let row = body_query.query_row((idx,), |row| {
             let (metadata, body, lens, date) = (
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -1593,7 +1593,10 @@ pub fn search(
                 .map(|s| s.to_string())
                 .collect();
             Ok((metadata, bodies, date))
-        })?;
+        }).optional()?;
+        let Some((metadata, bodies, date)) = row else {
+            continue;
+        };
 
         let sub = (sub_idx as usize).min(bodies.len().saturating_sub(1)) as u32;
         if seen.insert(idx, true).is_some() {
