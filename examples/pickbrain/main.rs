@@ -27,11 +27,30 @@ impl log::Log for SimpleLogger {
 }
 
 static LOGGER: SimpleLogger = SimpleLogger;
+const PICKBRAIN_DIR_ENV: &str = "PICKBRAIN_DIR";
 
-fn db_path() -> PathBuf {
+fn pickbrain_dir_overridden() -> bool {
+    env::var(PICKBRAIN_DIR_ENV)
+        .map(|dir| !dir.trim().is_empty())
+        .unwrap_or(false)
+}
+
+pub(crate) fn pickbrain_dir() -> PathBuf {
+    if let Ok(dir) = env::var(PICKBRAIN_DIR_ENV) {
+        if !dir.trim().is_empty() {
+            let dir = PathBuf::from(dir);
+            std::fs::create_dir_all(&dir).ok();
+            return dir;
+        }
+    }
     let home = env::var("HOME").unwrap_or_default();
     let dir = PathBuf::from(home).join(".pickbrain");
     std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
+fn db_path() -> PathBuf {
+    let dir = pickbrain_dir();
     dir.join("pickbrain.db")
 }
 
@@ -1891,6 +1910,9 @@ fn main() -> Result<()> {
                 eprintln!("  --unread             only unread conversations (Slack)");
                 eprintln!("  --dump ID            dump a session, channel, or thread");
                 eprintln!("  --turns N-M          limit turns/conversations in dump");
+                eprintln!();
+                eprintln!("Environment:");
+                eprintln!("  PICKBRAIN_DIR        override the pickbrain DB and state directory");
                 std::process::exit(0);
             }
             "--nuke" => {
@@ -1997,7 +2019,7 @@ fn main() -> Result<()> {
     let assets = assets_path();
 
     // Migrate DB from old location (~/.claude/pickbrain.db)
-    if !db_name.exists() {
+    if !pickbrain_dir_overridden() && !db_name.exists() {
         let home = env::var("HOME").unwrap_or_default();
         let old_db = PathBuf::from(home).join(".claude/pickbrain.db");
         if old_db.exists() {

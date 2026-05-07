@@ -121,17 +121,11 @@ fn blob_dir_mtime(dir: &Path) -> i64 {
 }
 
 fn watermark_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join(".pickbrain")
-        .join("slack.watermark")
+    crate::pickbrain_dir().join("slack.watermark")
 }
 
 fn self_user_cache_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home)
-        .join(".pickbrain")
-        .join("slack_self_user")
+    crate::pickbrain_dir().join("slack_self_user")
 }
 
 fn cache_self_user(id: &str, name: &str) {

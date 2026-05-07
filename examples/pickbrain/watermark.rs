@@ -3,6 +3,10 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 fn watermark_path(agent_dir: &str) -> PathBuf {
+    if crate::pickbrain_dir_overridden() {
+        let name = agent_dir.trim_start_matches('.');
+        return crate::pickbrain_dir().join(format!("{name}.watermark"));
+    }
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home).join(agent_dir).join("pickbrain.watermark")
 }
