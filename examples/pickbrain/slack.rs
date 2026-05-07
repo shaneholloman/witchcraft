@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use chrono::{Datelike, Timelike};
 use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -14,6 +15,7 @@ const SLACK_NAMESPACE: Uuid = Uuid::from_bytes([
 const DM_MAX_GAP_MS: i64 = 90 * 60_000;
 const CHANNEL_MAX_GAP_MS: i64 = 30 * 60_000;
 const MAX_SESSION_SPAN_MS: i64 = 24 * 3_600_000;
+const SLACK_INGEST_FORMAT_VERSION: &str = "2";
 const SYSTEM_SUBTYPES: &[&str] = &[
     "channel_join",
     "channel_joined",
@@ -128,6 +130,24 @@ fn self_user_cache_path() -> PathBuf {
     crate::pickbrain_dir().join("slack_self_user")
 }
 
+fn ingest_version_path() -> PathBuf {
+    crate::pickbrain_dir().join("slack.ingest_version")
+}
+
+fn ingest_format_is_current() -> bool {
+    std::fs::read_to_string(ingest_version_path())
+        .map(|s| s.trim() == SLACK_INGEST_FORMAT_VERSION)
+        .unwrap_or(false)
+}
+
+fn write_ingest_format_version() {
+    let p = ingest_version_path();
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir).ok();
+    }
+    std::fs::write(p, SLACK_INGEST_FORMAT_VERSION).ok();
+}
+
 fn cache_self_user(id: &str, name: &str) {
     let p = self_user_cache_path();
     if let Some(dir) = p.parent() {
@@ -153,6 +173,7 @@ fn read_watermark() -> i64 {
 
 pub fn remove_watermark() {
     std::fs::remove_file(watermark_path()).ok();
+    std::fs::remove_file(ingest_version_path()).ok();
 }
 
 fn write_watermark(ms: i64) {
@@ -460,6 +481,29 @@ fn ts_to_secs(ts: &str) -> Option<f64> {
     if secs > 0.0 { Some(secs) } else { None }
 }
 
+fn format_msg_ts(ts_ms: i64) -> String {
+    let secs = ts_ms.div_euclid(1000);
+    let Some(dt) = chrono::DateTime::from_timestamp(secs, 0) else {
+        return "??? ?? ??:??".to_string();
+    };
+    let month = match dt.month() {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "???",
+    };
+    format!("{month} {:02} {:02}:{:02}", dt.day(), dt.hour(), dt.minute())
+}
+
 fn collect_messages(state: &Value, self_user: Option<&(String, String)>) -> Vec<ParsedMessage> {
     let messages = match state.get("messages").and_then(|v| v.as_object()) {
         Some(m) => m,
@@ -645,7 +689,12 @@ fn group_into_conversations(
             }
         };
 
-        let labeled = format!("[{}] {}\n", msg.sender_name, msg.normalized_text);
+        let labeled = format!(
+            "[{}] [{}] {}\n",
+            format_msg_ts(msg.ts_ms),
+            msg.sender_name,
+            msg.normalized_text
+        );
 
         let conv = conversations.entry(key.clone()).or_insert_with(|| Conversation {
             key: key.clone(),
@@ -817,7 +866,8 @@ pub fn ingest_slack(db: &mut DB) -> Result<usize> {
 
     let current_mtime = blob_dir_mtime(&blob_dir);
     let prev_watermark = read_watermark();
-    if current_mtime > 0 && current_mtime <= prev_watermark {
+    let format_changed = !ingest_format_is_current();
+    if current_mtime > 0 && current_mtime <= prev_watermark && !format_changed {
         return Ok(0);
     }
 
@@ -846,6 +896,7 @@ pub fn ingest_slack(db: &mut DB) -> Result<usize> {
     if current_mtime > 0 {
         write_watermark(current_mtime);
     }
+    write_ingest_format_version();
 
     Ok(count)
 }
@@ -855,7 +906,7 @@ pub fn has_work() -> bool {
         return false;
     };
     let current_mtime = blob_dir_mtime(&blob_dir);
-    current_mtime > 0 && current_mtime > read_watermark()
+    !ingest_format_is_current() || (current_mtime > 0 && current_mtime > read_watermark())
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
@@ -933,6 +984,10 @@ mod tests {
         let conversations = group_into_conversations(deduped, &HashMap::new());
         assert_eq!(conversations.len(), 1);
         assert_eq!(conversations[0].key, "sess:C1-1000.000100");
+        assert_eq!(
+            conversations[0].messages[0].labeled,
+            "[Jan 01 00:16] [Ada (@ada)] edited root\n"
+        );
     }
 
     #[test]
