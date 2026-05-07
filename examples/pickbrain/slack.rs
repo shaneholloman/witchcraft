@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use chrono::{Datelike, Timelike};
 use regex::Regex;
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -789,6 +790,19 @@ fn remove_subsumed_session_docs(db: &mut DB, conv: &Conversation) -> Result<()> 
     Ok(())
 }
 
+fn existing_doc_parts(db: &DB, uuid: &Uuid) -> Result<Option<(String, String, String)>> {
+    let mut query = db.query("SELECT metadata, body, lens FROM document WHERE uuid = ?1")?;
+    Ok(query
+        .query_row((uuid.to_string(),), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .optional()?)
+}
+
 fn ingest_conversations(db: &mut DB, conversations: Vec<Conversation>) -> Result<usize> {
     let mut count = 0;
     let mut channel_idx: HashMap<String, usize> = HashMap::new();
@@ -803,6 +817,11 @@ fn ingest_conversations(db: &mut DB, conversations: Vec<Conversation>) -> Result
             .iter()
             .map(|m| m.labeled.chars().count())
             .collect();
+        let lens_str = lens
+            .iter()
+            .map(|len| len.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
 
         remove_subsumed_session_docs(db, conv)?;
 
@@ -841,19 +860,28 @@ fn ingest_conversations(db: &mut DB, conversations: Vec<Conversation>) -> Result
             "has_unread": conv.has_unread,
             "unread_count": conv.unread_count,
         });
+        let metadata = metadata.to_string();
 
         let ts = date.as_ref().map(|d| {
             iso8601_timestamp::Timestamp::parse(d).unwrap_or_else(|| iso8601_timestamp::Timestamp::now_utc())
         });
 
-        db.add_doc(
-            &uuid,
-            ts,
-            &metadata.to_string(),
-            &body,
-            Some(lens),
-        )?;
-        count += 1;
+        let existing = existing_doc_parts(db, &uuid)?;
+        let body_changed = existing
+            .as_ref()
+            .map(|(_, old_body, old_lens)| old_body != &body || old_lens != &lens_str)
+            .unwrap_or(true);
+        let metadata_changed = existing
+            .as_ref()
+            .map(|(old_metadata, _, _)| old_metadata != &metadata)
+            .unwrap_or(true);
+
+        if body_changed || metadata_changed {
+            db.add_doc(&uuid, ts, &metadata, &body, Some(lens))?;
+        }
+        if body_changed {
+            count += 1;
+        }
     }
     Ok(count)
 }
@@ -1048,6 +1076,35 @@ mod tests {
             .query("SELECT json_extract(metadata, '$.conv_key') FROM document")?
             .query_row((), |row| row.get(0))?;
         assert_eq!(conv_key, "sess:C1-1000.000100");
+
+        Ok(())
+    }
+
+    #[test]
+    fn unchanged_conversation_is_not_counted_as_ingested() -> Result<()> {
+        let dir = tempdir()?;
+        let mut db = DB::new(dir.path().join("pickbrain.db"))?;
+
+        let conv = || Conversation {
+            key: "sess:C1-1000.000100".to_string(),
+            channel_id: "C1".to_string(),
+            channel_name: "general".to_string(),
+            is_dm: false,
+            team_id: "T1".to_string(),
+            root_ref_ts: "1000.000100".to_string(),
+            first_ts_ms: ts_to_ms("1000.000100").unwrap(),
+            latest_ts_ms: ts_to_ms("1000.000100").unwrap(),
+            latest_ref_ts: "1000.000100".to_string(),
+            has_unread: false,
+            unread_count: 0,
+            messages: vec![ConvMessage {
+                ts_ms: ts_to_ms("1000.000100").unwrap(),
+                labeled: "[Jan 01 00:16] [Ada] hello\n".to_string(),
+            }],
+        };
+
+        assert_eq!(ingest_conversations(&mut db, vec![conv()])?, 1);
+        assert_eq!(ingest_conversations(&mut db, vec![conv()])?, 0);
 
         Ok(())
     }
