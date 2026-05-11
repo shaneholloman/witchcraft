@@ -1,16 +1,16 @@
-import torch
-import torch.nn as nn
-from huggingface_hub import hf_hub_download, snapshot_download
-from safetensors.torch import save_file
+
 import os
 import shutil
 
+print("importing pytorch...")
+import torch
+print("importing huggingface modules...")
+
+from huggingface_hub import hf_hub_download, snapshot_download
+from safetensors.torch import save_file
 from transformers import T5EncoderModel
 
-snapshot_download(repo_id="google/xtr-base-en", local_dir="xtr-base-en",
-                  local_dir_use_symlinks=False, revision="main")
-
-class XTR(nn.Module):
+class XTR(torch.nn.Module):
     def __init__(self):
         super().__init__()
 
@@ -20,7 +20,7 @@ class XTR(nn.Module):
         )
         self.encoder = encoder_model.encoder
 
-        self.linear = nn.Linear(768, 128, bias=False)
+        self.linear = torch.nn.Linear(768, 128, bias=False)
         to_dense_path = hf_hub_download(
             repo_id="google/xtr-base-en",
             filename="2_Dense/pytorch_model.bin",
@@ -34,8 +34,14 @@ class XTR(nn.Module):
         return self.linear(hidden_states)
 
 
+print("downloading pretrained XTR model...")
+snapshot_download(repo_id="google/xtr-base-en", local_dir="xtr-base-en",
+                  local_dir_use_symlinks=False, revision="main")
+
+print("loading model...")
 xtr = XTR()
 fp16_state_dict = {k: v.half().cpu() for k, v in xtr.state_dict().items()}
+print("writing as .safetensors...")
 save_file(fp16_state_dict, "xtr.safetensors")
 print(f"Saved xtr.safetensors with {len(fp16_state_dict)} tensors")
 
