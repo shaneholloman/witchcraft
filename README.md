@@ -13,6 +13,10 @@ original XTR-WARP on server-class hardware, at similar accuracy.)
 
 ![pickbrain](pickbrain.png)
 
+# Prerequisites #
+
+Needs uv, make, and the rust toolchain.
+
 # Building and Running #
 To run, you will need the XTR weights released by Google Deepmind, and
 this repo contains python scripts for downloading them from Huggingface
