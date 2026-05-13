@@ -344,11 +344,16 @@ fn read_turn_at(path: &str, source: &str, tm: &TurnMeta) -> Option<SessionTurn> 
     let text = if source == "codex" {
         let payload = v.get("payload")?;
         let ptype = payload.get("type")?.as_str()?;
-        if ptype == "message" && payload.get("role")?.as_str()? == "user" {
+        if ptype == "message" {
+            let text_type = match payload.get("role")?.as_str()? {
+                "user" => "input_text",
+                "assistant" => "output_text",
+                _ => return None,
+            };
             let content = payload.get("content")?.as_array()?;
             let texts: Vec<&str> = content
                 .iter()
-                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("input_text"))
+                .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some(text_type))
                 .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
                 .collect();
             texts.join("\n")
@@ -1842,7 +1847,11 @@ fn dump(db_name: &PathBuf, session_id: &str, turns_range: Option<&str>, since_ms
             writeln!(buf, "turn {}  {}", *turn, format_date(date))?;
         }
         for line in body.lines().skip_while(|l| {
-            !is_channel && l.starts_with('[') && !l.starts_with("[User]") && !l.starts_with("[Claude]")
+            !is_channel
+                && l.starts_with('[')
+                && !l.starts_with("[User]")
+                && !l.starts_with("[Claude]")
+                && !l.starts_with("[Codex]")
         }) {
             writeln!(buf, "{line}")?;
         }

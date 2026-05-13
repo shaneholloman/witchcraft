@@ -64,23 +64,26 @@ fn compact(text: &str) -> String {
     re.replace_all(text, " ").trim().to_string()
 }
 
-fn extract_user_text(payload: &serde_json::Value) -> Option<String> {
+fn extract_message_text(payload: &serde_json::Value) -> Option<(String, String)> {
     if payload.get("type")?.as_str()? != "message" {
         return None;
     }
-    if payload.get("role")?.as_str()? != "user" {
-        return None;
-    }
+    let role = payload.get("role")?.as_str()?;
+    let text_type = match role {
+        "user" => "input_text",
+        "assistant" => "output_text",
+        _ => return None,
+    };
     let content = payload.get("content")?.as_array()?;
     let texts: Vec<&str> = content
         .iter()
-        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("input_text"))
+        .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some(text_type))
         .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
         .collect();
     if texts.is_empty() {
         None
     } else {
-        Some(texts.join("\n"))
+        Some((role.to_string(), texts.join("\n")))
     }
 }
 
@@ -175,8 +178,8 @@ fn parse_session_file(path: &Path) -> (SessionMeta, Vec<Chunk>) {
         }
 
         let (role, raw_text) = if entry.entry_type == "response_item" {
-            if let Some(text) = extract_user_text(&entry.payload) {
-                ("user".to_string(), text)
+            if let Some((role, text)) = extract_message_text(&entry.payload) {
+                (role, text)
             } else {
                 continue;
             }
@@ -494,6 +497,18 @@ mod tests {
         })).unwrap()
     }
 
+    fn assistant_msg_line(text: &str, ts: &str) -> String {
+        serde_json::to_string(&serde_json::json!({
+            "type": "response_item",
+            "timestamp": ts,
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": text }]
+            }
+        })).unwrap()
+    }
+
     fn checkout_line(output: &str) -> String {
         serde_json::to_string(&serde_json::json!({
             "type": "event_msg",
@@ -517,6 +532,23 @@ mod tests {
         assert_eq!(meta.branch.as_deref(), Some("main"));
         assert_eq!(meta.cwd.as_deref(), Some("/Users/me/src/server"));
         assert_eq!(chunks.len(), 1);
+    }
+
+    #[test]
+    fn test_codex_parse_assistant_message() {
+        let content = format!(
+            "{}\n{}\n{}\n",
+            session_meta_line("/Users/me/src/server", "main"),
+            user_msg_line("hello world from the user", "2025-01-15T10:00:00Z"),
+            assistant_msg_line("hello back from codex", "2025-01-15T10:01:00Z"),
+        );
+        let f = write_tempfile(&content);
+        let (_, chunks) = parse_session_file(f.path());
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].role, "user");
+        assert_eq!(chunks[0].text, "hello world from the user");
+        assert_eq!(chunks[1].role, "assistant");
+        assert_eq!(chunks[1].text, "hello back from codex");
     }
 
     #[test]
