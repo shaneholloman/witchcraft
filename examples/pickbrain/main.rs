@@ -1406,9 +1406,17 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        let end = s.floor_char_boundary(max.saturating_sub(3));
+        let end = floor_char_boundary(s, max.saturating_sub(3));
         format!("{}...", &s[..end])
     }
+}
+
+fn floor_char_boundary(s: &str, index: usize) -> usize {
+    let mut index = index.min(s.len());
+    while !s.is_char_boundary(index) {
+        index -= 1;
+    }
+    index
 }
 
 // --- Plain text fallback (piped output) ---
@@ -2153,4 +2161,28 @@ mod tests {
         assert_eq!(f.statements.unwrap().len(), 2);
     }
 
+    #[test]
+    fn test_floor_char_boundary_matches_std_cases() {
+        fn check_many(s: &str, arg: impl IntoIterator<Item = usize>, ret: usize) {
+            for idx in arg {
+                assert_eq!(floor_char_boundary(s, idx), ret);
+            }
+        }
+
+        check_many("", [0, 1, isize::MAX as usize, usize::MAX], 0);
+        check_many("x", [0], 0);
+        check_many("x", [1, isize::MAX as usize, usize::MAX], 1);
+        check_many("jp", [0], 0);
+        check_many("jp", [1], 1);
+        check_many("jp", 2..4, 2);
+        check_many("ĵƥ", 0..2, 0);
+        check_many("ĵƥ", 2..4, 2);
+        check_many("ĵƥ", 4..6, 4);
+        check_many("日本", 0..3, 0);
+        check_many("日本", 3..6, 3);
+        check_many("日本", 6..8, 6);
+        check_many("🇯🇵", 0..4, 0);
+        check_many("🇯🇵", 4..8, 4);
+        check_many("🇯🇵", 8..10, 8);
+    }
 }
