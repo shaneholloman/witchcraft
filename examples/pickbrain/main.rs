@@ -1294,8 +1294,8 @@ fn search_tui(
                         if !r.session_id.is_empty() && !r.path.is_empty() && !r.turns.is_empty() {
                             let mi = if r.match_idx > 0 { r.match_idx - 1 } else { 0 };
                             let mut turns = Vec::new();
-                            for tm in &r.turns {
-                                if let Some(turn) = read_turn_at(&r.path, &r.source, tm) {
+                            for (turn_idx, tm) in r.turns.iter().enumerate() {
+                                if let Some(turn) = read_or_indexed_turn(r, turn_idx, tm) {
                                     turns.push(turn);
                                 }
                             }
@@ -1498,6 +1498,27 @@ fn strip_body_prefix(s: &str) -> &str {
         .unwrap_or(s)
 }
 
+fn indexed_turn_text(r: &SearchResult, turn_idx: usize) -> Option<String> {
+    r.bodies
+        .get(turn_idx + 1)
+        .map(|body| strip_body_prefix(body).trim_end().to_string())
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn indexed_turn(r: &SearchResult, turn_idx: usize, tm: &TurnMeta) -> Option<SessionTurn> {
+    Some(SessionTurn {
+        role: tm.role.clone(),
+        text: indexed_turn_text(r, turn_idx)?,
+        timestamp: tm.timestamp.clone(),
+    })
+}
+
+fn read_or_indexed_turn(r: &SearchResult, turn_idx: usize, tm: &TurnMeta) -> Option<SessionTurn> {
+    read_turn_at(&r.path, &r.source, tm)
+        .filter(|turn| !turn.text.trim().is_empty())
+        .or_else(|| indexed_turn(r, turn_idx, tm))
+}
+
 fn first_line(text: &str) -> String {
     text.lines()
         .find(|l| !l.trim().is_empty())
@@ -1608,7 +1629,7 @@ fn search_plain(
                 };
                 let prefix = if i == mi { ">>>" } else { "  " };
                 writeln!(buf, "{prefix} {label} {}", format_date(&tm.timestamp))?;
-                if let Some(turn) = read_turn_at(&r.path, &r.source, tm) {
+                if let Some(turn) = read_or_indexed_turn(r, i, tm) {
                     for line in turn.text.lines().take(10) {
                         writeln!(buf, "{prefix}   {line}")?;
                     }
@@ -2244,6 +2265,43 @@ mod tests {
     fn test_session_meta_spans_preserves_formatted_date() {
         let spans = session_meta_spans("May 12 10:09", "DM", "", "", "slack", "", "");
         assert_eq!(spans[0].content.as_ref(), "May 12 10:09 ");
+    }
+
+    #[test]
+    fn test_indexed_turn_text_strips_role_prefix() {
+        let result = SearchResult {
+            timestamp: String::new(),
+            project: String::new(),
+            session_id: String::new(),
+            session_name: String::new(),
+            turn: 0,
+            path: String::new(),
+            cwd: String::new(),
+            source: "claude".to_string(),
+            branch: String::new(),
+            conv_key: String::new(),
+            bodies: vec![
+                "[project] title\n".to_string(),
+                "[User] run oxidize\nmore text\n".to_string(),
+                "[Claude] done\n".to_string(),
+            ],
+            match_idx: 1,
+            turns: Vec::new(),
+        };
+        assert_eq!(
+            indexed_turn_text(&result, 0).as_deref(),
+            Some("run oxidize\nmore text")
+        );
+        let tm = TurnMeta {
+            role: "user".to_string(),
+            timestamp: "2026-04-15T14:12:36.044Z".to_string(),
+            byte_offset: 0,
+            byte_len: 0,
+        };
+        let turn = read_or_indexed_turn(&result, 0, &tm).unwrap();
+        assert_eq!(turn.role, "user");
+        assert_eq!(turn.timestamp, "2026-04-15T14:12:36.044Z");
+        assert_eq!(turn.text, "run oxidize\nmore text");
     }
 
     #[test]
